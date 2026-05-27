@@ -1,9 +1,10 @@
-import asyncio
 import os
 import logging
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 import coc
 from prettytable import PrettyTable
 
@@ -194,16 +195,38 @@ async def cmd_remind(message: types.Message):
         await message.answer("❌ Не удалось проверить атаки.")
 
 # ------------------------------------------------------------
-# Запуск бота (асинхронная функция main)
+# Основная функция для запуска бота через вебхук
 # ------------------------------------------------------------
-async def main():
-    logger.info("Telegram-бот запускается...")
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+async def on_startup() -> None:
+    """Действия при запуске бота."""
+    # Устанавливаем вебхук
+    webhook_url = os.getenv('RENDER_EXTERNAL_URL')
+    if not webhook_url:
+        logger.error("Переменная окружения RENDER_EXTERNAL_URL не найдена!")
+        return
+    await bot.set_webhook(f"{webhook_url}/webhook")
 
-def run():
-    asyncio.run(main())
+def main() -> None:
+    """Запуск бота и веб-сервера."""
+    # Инициализируем веб-приложение
+    app = web.Application()
+    
+    # Настраиваем обработчик вебхуков
+    webhook_requests_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    )
+    webhook_requests_handler.register(app, path="/webhook")
+    
+    # Настраиваем эндпоинт для проверки здоровья Render
+    app.router.add_get("/health", lambda request: web.Response(text="OK"))
+    
+    # Устанавливаем функцию, которая выполнится при старте приложения
+    app.on_startup.append(on_startup)
+    
+    # Запускаем веб-сервер
+    port = int(os.environ.get('PORT', 8080))
+    web.run_app(app, host='0.0.0.0', port=port)
 
-# Если файл запущен напрямую (не через app.py)
-if __name__ == "__main__":
-    run()
+if __name__ == '__main__':
+    main()
