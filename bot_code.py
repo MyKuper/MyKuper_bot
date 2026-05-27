@@ -90,7 +90,6 @@ async def handle_members_list(update: types.Message | types.CallbackQuery):
     if not coc_client: return
     try:
         clan = await coc_client.get_clan(CLAN_TAG)
-        # Проверка на наличие участников
         if not hasattr(clan, 'members') or not clan.members:
             raise ValueError("Список участников пуст или недоступен")
             
@@ -134,7 +133,6 @@ async def handle_war_info(update: types.Message | types.CallbackQuery):
         our_clan = war.clan
         enemy_clan = war.opponent
         
-        # Безопасное получение данных
         our_stars = getattr(our_clan, 'stars', 0)
         enemy_stars = getattr(enemy_clan, 'stars', 0)
         our_dest = getattr(our_clan, 'destruction', 0)
@@ -153,7 +151,6 @@ async def handle_war_info(update: types.Message | types.CallbackQuery):
         table.align["Цель"] = "l"
         
         attacks_displayed = 0
-        # Проверка наличия атак
         if hasattr(our_clan, 'members') and our_clan.members:
             for member in our_clan.members:
                 if not hasattr(member, 'attacks'): continue
@@ -262,7 +259,7 @@ async def cmd_start(message: types.Message):
     text = f"👋 Привет, {message.from_user.first_name}!\n\nЯ бот-помощник для управления кланом.\nВыберите действие:"
     await message.answer(text, reply_markup=get_main_keyboard())
 
-@dp.message(Command("help"), AdminFilter()):
+@dp.message(Command("help"), AdminFilter())  # ИСПРАВЛЕНО: убрано двоеточие
 async def cmd_help(message: types.Message):
     await cmd_start(message)
 
