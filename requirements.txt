@@ -1,3 +1,5 @@
-aiogram==3.17.0
+aiogram==3.10.0
+pydantic==2.7.1
+pydantic-core==2.18.2
 coc.py==3.9.1
-aiohttp
+aiohttp==3.10.10
