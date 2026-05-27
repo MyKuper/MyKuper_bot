@@ -3,14 +3,14 @@ import logging
 import asyncio
 import sqlite3
 import datetime
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, Filter
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.sqlite import SQLiteStorage
 from aiohttp import web
 import coc
 from prettytable import PrettyTable
@@ -21,7 +21,6 @@ from prettytable import PrettyTable
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 COC_EMAIL = os.getenv('COC_EMAIL')
 COC_PASSWORD = os.getenv('COC_PASSWORD')
-CLAN_TAG = "#2CY00G2VU"
 PROXY_URL = os.getenv('COC_PROXY', None)
 ADMIN_IDS = [1810701319]
 DB_FILE = "bot_data.db"
@@ -46,42 +45,80 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (tg_id INTEGER PRIMARY KEY, tg_username TEXT, is_admin INTEGER DEFAULT 0)''')
     c.execute('''CREATE TABLE IF NOT EXISTS linked_accounts
-                 (tg_id INTEGER, player_tag TEXT, player_name TEXT,
+                 (tg_id INTEGER, player_tag TEXT, player_name TEXT, clan_tag TEXT,
                  PRIMARY KEY (tg_id, player_tag))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS user_active_clan
+                 (tg_id INTEGER PRIMARY KEY, clan_tag TEXT)''')
     conn.commit()
     conn.close()
 
-def link_account_db(tg_id, tg_username, player_tag, player_name):
+def link_account_db(tg_id, tg_username, player_tag, player_name, clan_tag):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO users (tg_id, tg_username) VALUES (?, ?)", (tg_id, tg_username))
     c.execute("UPDATE users SET tg_username = ? WHERE tg_id = ?", (tg_username, tg_id))
-    c.execute("INSERT OR REPLACE INTO linked_accounts (tg_id, player_tag, player_name) VALUES (?, ?, ?)",
-              (tg_id, player_tag, player_name))
+    c.execute("INSERT OR REPLACE INTO linked_accounts (tg_id, player_tag, player_name, clan_tag) VALUES (?, ?, ?, ?)",
+              (tg_id, player_tag, player_name, clan_tag))
+    # Автоматически устанавливаем первый привязанный клан как активный
+    c.execute("INSERT OR IGNORE INTO user_active_clan (tg_id, clan_tag) VALUES (?, ?)", (tg_id, clan_tag))
     conn.commit()
     conn.close()
 
-def get_linked_accounts_db() -> Dict[str, str]:
+def get_linked_accounts_db(tg_id: int = None) -> Dict[str, str]:
+    """Возвращает словарь {player_tag: @username} для указанного tg_id или всех"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT player_tag, tg_username FROM linked_accounts JOIN users ON linked_accounts.tg_id = users.tg_id")
+    if tg_id:
+        c.execute("""SELECT player_tag, tg_username FROM linked_accounts 
+                     JOIN users ON linked_accounts.tg_id = users.tg_id 
+                     WHERE linked_accounts.tg_id = ?""", (tg_id,))
+    else:
+        c.execute("""SELECT player_tag, tg_username FROM linked_accounts 
+                     JOIN users ON linked_accounts.tg_id = users.tg_id""")
     mapping = {row[0]: f"@{row[1]}" for row in c.fetchall() if row[1]}
     conn.close()
     return mapping
 
-def get_user_accounts_db(tg_id) -> list:
+def get_user_accounts_db(tg_id) -> List[tuple]:
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT player_name, player_tag FROM linked_accounts WHERE tg_id = ?", (tg_id,))
+    c.execute("SELECT player_name, player_tag, clan_tag FROM linked_accounts WHERE tg_id = ?", (tg_id,))
     accounts = c.fetchall()
     conn.close()
     return accounts
+
+def get_user_active_clan(tg_id) -> Optional[str]:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT clan_tag FROM user_active_clan WHERE tg_id = ?", (tg_id,))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+def set_user_active_clan(tg_id, clan_tag):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO user_active_clan (tg_id, clan_tag) VALUES (?, ?)", (tg_id, clan_tag))
+    conn.commit()
+    conn.close()
+
+def get_all_user_clans(tg_id) -> List[tuple]:
+    """Возвращает уникальные кланы пользователя [(clan_tag, count), ...]"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""SELECT clan_tag, COUNT(*) as cnt FROM linked_accounts 
+                 WHERE tg_id = ? GROUP BY clan_tag""", (tg_id,))
+    clans = c.fetchall()
+    conn.close()
+    return clans
 
 # ============================================================
 # 🤖 ИНИЦИАЛИЗАЦИЯ
 # ============================================================
 bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+# SQLiteStorage сохраняет FSM состояния при перезапуске!
+storage = SQLiteStorage(DB_FILE)
+dp = Dispatcher(storage=storage)
 coc_client: Optional[coc.Client] = None
 
 # ============================================================
@@ -92,7 +129,31 @@ class LinkAccount(StatesGroup):
     waiting_for_confirmation = State()
 
 # ============================================================
-# ⌨️ МЕНЮ (Как у Жоры)
+# 🧩 ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================
+async def get_tg_id(update) -> int:
+    """Получает tg_id из message или callback"""
+    if isinstance(update, types.Message):
+        return update.from_user.id
+    elif isinstance(update, types.CallbackQuery):
+        return update.from_user.id
+    return 0
+
+async def check_user_clan(update) -> Optional[str]:
+    """Проверяет что у пользователя есть активный клан"""
+    tg_id = await get_tg_id(update)
+    clan_tag = get_user_active_clan(tg_id)
+    
+    if not clan_tag:
+        await send_msg(update, 
+            "⚠️ У вас не выбран активный клан!\n"
+            "Сначала привяжите аккаунт командой /link\n"
+            "или выберите клан: /switch_clan")
+        return None
+    return clan_tag
+
+# ============================================================
+# ⌨️ МЕНЮ
 # ============================================================
 def get_main_menu() -> InlineKeyboardMarkup:
     kb = [
@@ -100,6 +161,7 @@ def get_main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🏰 КЛАН", callback_data="menu_clan")],
         [InlineKeyboardButton(text="👤 ПРОФИЛЬ", callback_data="menu_profile")],
         [InlineKeyboardButton(text="🔗 Привязать аккаунт", callback_data="link_account")],
+        [InlineKeyboardButton(text="🔄 Сменить клан", callback_data="switch_clan")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
@@ -134,15 +196,19 @@ def get_back_keyboard(dest: str = "back_main") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data=dest)]])
 
 # ============================================================
-# 🧠 ЛОГИКА
+# 🧠 ЛОГИКА (с поддержкой мультикланов)
 # ============================================================
 
 async def handle_clan_info(update: types.Message | types.CallbackQuery):
+    clan_tag = await check_user_clan(update)
+    if not clan_tag:
+        return
+        
     if not coc_client:
         await send_msg(update, "❌ Клиент COC не подключен.")
         return
     try:
-        clan = await coc_client.get_clan(CLAN_TAG)
+        clan = await coc_client.get_clan(clan_tag)
         text = (
             f"🏰 <b>{clan.name}</b> <code>{clan.tag}</code>\n\n"
             f"📊 Уровень: <code>{clan.level}</code>\n"
@@ -158,12 +224,17 @@ async def handle_clan_info(update: types.Message | types.CallbackQuery):
         await send_msg(update, "❌ Не удалось загрузить инфо о клане.")
 
 async def handle_clan_members(update: types.Message | types.CallbackQuery):
+    clan_tag = await check_user_clan(update)
+    if not clan_tag:
+        return
+        
     if not coc_client:
         await send_msg(update, "❌ Клиент COC не подключен.")
         return
     try:
-        clan = await coc_client.get_clan(CLAN_TAG)
-        tg_mapping = get_linked_accounts_db()
+        clan = await coc_client.get_clan(clan_tag)
+        tg_id = await get_tg_id(update)
+        tg_mapping = get_linked_accounts_db(tg_id)
         
         text = f"👥 <b>Участники клана {clan.name}</b> ({clan.member_count}/50):\n\n"
         
@@ -180,12 +251,17 @@ async def handle_clan_members(update: types.Message | types.CallbackQuery):
         await send_msg(update, "❌ Не удалось загрузить список.")
 
 async def handle_clan_donations(update: types.Message | types.CallbackQuery):
+    clan_tag = await check_user_clan(update)
+    if not clan_tag:
+        return
+        
     if not coc_client:
         await send_msg(update, "❌ Клиент COC не подключен.")
         return
     try:
-        clan = await coc_client.get_clan(CLAN_TAG)
-        tg_mapping = get_linked_accounts_db()
+        clan = await coc_client.get_clan(clan_tag)
+        tg_id = await get_tg_id(update)
+        tg_mapping = get_linked_accounts_db(tg_id)
         
         members_data = []
         for member in clan.members:
@@ -198,7 +274,6 @@ async def handle_clan_donations(update: types.Message | types.CallbackQuery):
                 'received': member.donations_received
             })
         
-        # Топ по пожертвованиям
         top_donated = sorted(members_data, key=lambda x: x['donated'], reverse=True)[:10]
         top_received = sorted(members_data, key=lambda x: x['received'], reverse=True)[:10]
         
@@ -222,7 +297,7 @@ async def handle_my_stats(update: types.Message | types.CallbackQuery):
         await send_msg(update, "❌ Клиент COC не подключен.")
         return
         
-    tg_id = update.from_user.id if isinstance(update, types.Message) else update.message.from_user.id
+    tg_id = await get_tg_id(update)
     accounts = get_user_accounts_db(tg_id)
     
     if not accounts:
@@ -231,7 +306,7 @@ async def handle_my_stats(update: types.Message | types.CallbackQuery):
     
     text = "📊 <b>Ваша статистика</b>\n\n"
     
-    for name, tag in accounts:
+    for name, tag, clan_tag in accounts:
         try:
             player = await coc_client.get_player(tag)
             text += f"👤 <b>{player.name}</b> (<code>{tag}</code>)\n"
@@ -240,19 +315,24 @@ async def handle_my_stats(update: types.Message | types.CallbackQuery):
             text += f"   ⚔️ Атак побед: <code>{player.attack_wins}</code>\n"
             text += f"   🛡️ Защит побед: <code>{player.defense_wins}</code>\n"
             text += f"   🎁 Пожертвовано: <code>{player.donations}</code>\n"
-            text += f"   📥 Получено: <code>{player.donations_received}</code>\n\n"
+            text += f"   📥 Получено: <code>{player.donations_received}</code>\n"
+            text += f"   🏰 Клан: <code>{clan_tag}</code>\n\n"
         except Exception as e:
             text += f"👤 {name} - ❌ Ошибка загрузки\n\n"
             
     await send_msg(update, text, parse_mode="HTML", reply_markup=get_back_keyboard("menu_profile"))
 
 async def handle_war_plan(update: types.Message | types.CallbackQuery, generate_report: bool = False):
+    clan_tag = await check_user_clan(update)
+    if not clan_tag:
+        return
+        
     if not coc_client:
         await send_msg(update, "❌ Клиент COC не подключен.")
         return
 
     try:
-        war = await coc_client.get_current_war(CLAN_TAG)
+        war = await coc_client.get_current_war(clan_tag)
         
         if war.state == "notInWar":
             await send_msg(update, "🔍 Сейчас нет активной войны.", reply_markup=get_back_keyboard("menu_war"))
@@ -261,7 +341,8 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery, generate_
         our_clan = war.clan
         enemy_clan = war.opponent
         
-        tg_mapping = get_linked_accounts_db()
+        tg_id = await get_tg_id(update)
+        tg_mapping = get_linked_accounts_db(tg_id)
 
         # --- Сбор данных ---
         our_members_info = []
@@ -303,16 +384,15 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery, generate_
         # --- Состав ---
         our_sorted_by_pos = sorted(our_members_info, key=lambda x: (x['map_pos'] if isinstance(x['map_pos'], int) else 99))
         
-        roster_text = "👥 <b>СОСТАВ И ПОЗИЦИИ:</b>\n"
+        roster_lines = []
         lazy_list = []
         
         for m in our_sorted_by_pos:
             pos_str = f"Поз. {m['map_pos']}" if isinstance(m['map_pos'], int) else "Поз. ?"
             att_str = f"{m['attacks_count']}/{war.attacks_per_member}"
-            roster_text += f"• <code>{pos_str}</code> | {m['name']} (ТХ{m['th']}) - Атаки: {att_str}\n"
+            roster_lines.append(f"• <code>{pos_str}</code> | {m['name']} (ТХ{m['th']}) - Атаки: {att_str}")
                 
             if m['attacks_count'] < war.attacks_per_member:
-                # Добавляем упоминание через @ если есть
                 mention = f" ({tg_mapping[m['obj'].tag]})" if m['obj'].tag in tg_mapping else ""
                 lazy_list.append(f"• {m['raw_name']}{mention} (ТХ{m['th']}) - осталось {war.attacks_per_member - m['attacks_count']}")
 
@@ -425,20 +505,22 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery, generate_
             t = pair['target']
             table_2.add_row([f"{a['name']} (ТХ{a['th']})", f"{t['name']} (ТХ{t['th']})", pair['rec']])
 
-        # --- Отправка в чат ---
+        # --- Отправка в чат (обычный режим) ---
         if not generate_report:
             await send_msg(update, header, parse_mode="HTML")
             
-            # Разбиваем состав на части если длинный
+            # Разбиваем состав на части
+            roster_text = "👥 <b>СОСТАВ И ПОЗИЦИИ:</b>\n"
             roster_chunks = []
-            current_chunk = "👥 <b>СОСТАВ И ПОЗИЦИИ:</b>\n"
-            for line in roster_text.split('\n')[1:]:  # Пропускаем заголовок
+            current_chunk = roster_text
+            
+            for line in roster_lines:
                 if len(current_chunk) + len(line) + 1 > 3800:
                     roster_chunks.append(current_chunk)
                     current_chunk = line + '\n'
                 else:
                     current_chunk += line + '\n'
-            if current_chunk.strip():
+            if current_chunk.strip() != roster_text.strip():
                 roster_chunks.append(current_chunk)
                 
             for i, chunk in enumerate(roster_chunks):
@@ -460,40 +542,77 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery, generate_
                 msg_2 = "<i>Нет доступных вторых атак или целей.</i>"
             await send_msg(update, msg_2, parse_mode="HTML", reply_markup=get_back_keyboard("menu_war"))
 
-        # --- Генерация полного отчета ---
+        # --- Генерация полного отчета (Markdown файл) ---
         if generate_report:
             try:
                 os.makedirs('reports', exist_ok=True)
                 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-                filename = f"reports/war_report_{timestamp}.md"
+                clan_name = our_clan.name.replace(' ', '_').replace('/', '_')
+                enemy_name = enemy_clan.name.replace(' ', '_').replace('/', '_')
+                filename = f"reports/war_{clan_name}_vs_{enemy_name}_{timestamp}.md"
                 
-                with open(filename, 'w', encoding='utf-8') as f:
-                    # Заголовок
-                    f.write(header.replace('<b>', '**').replace('</b>', '**')
-                           .replace('<code>', '`').replace('</code>', '`')
-                           .replace('<i>', '*').replace('</i>', '*') + "\n")
-                    
-                    # Состав
-                    for chunk in roster_chunks:
-                        f.write(chunk.replace('<b>', '**').replace('</b>', '**')
-                               .replace('<code>', '`').replace('</code>', '`') + "\n")
-                    
-                    # План
-                    f.write(plan_text.replace('<b>', '**').replace('</b>', '**')
-                           .replace('<i>', '*').replace('</i>', '*') + "\n")
-                    
-                    # Таблицы
-                    f.write(f"\n## 1️⃣ ОСНОВНОЙ УДАР\n```text\n{table_1}\n```\n\n")
-                    if second_strike_plan:
-                        f.write(f"## 2️⃣ ДОБИВАНИЕ И НАБИВКА\n```text\n{table_2}\n```\n")
-                        
-                if isinstance(update, types.Message):
-                    await update.answer_document(FSInputFile(filename), caption="📁 Полный отчет войны (Markdown)")
+                # Формируем полный текст
+                md_content = []
+                
+                # Заголовок
+                md_content.append("# ⚔️ ВОЙНА")
+                md_content.append(f"## {our_clan.name} vs {enemy_clan.name}\n")
+                md_content.append(f"📊 **Счёт:** `{our_clan.stars}` : `{enemy_clan.stars}`")
+                md_content.append(f"💥 **Разрушение:** `{our_clan.destruction:.1f}%` : `{enemy_clan.destruction:.1f}%`")
+                md_content.append(f"⏳ **Статус:** `{war.state}`\n")
+                
+                # Состав
+                md_content.append("## 👥 Состав и позиции\n")
+                for line in roster_lines:
+                    clean = line.replace('<code>', '`').replace('</code>', '`')
+                    md_content.append(clean)
+                md_content.append("")
+                
+                if lazy_list:
+                    md_content.append(f"### ⚠️ Требуют внимания ({len(lazy_list)} чел.)")
+                    for l in lazy_list:
+                        md_content.append(l)
+                    md_content.append("")
                 else:
-                    await update.message.answer_document(FSInputFile(filename), caption="📁 Полный отчет войны (Markdown)")
+                    md_content.append("✅ Все участники использовали все атаки!\n")
+                
+                # AI План
+                md_content.append("## 🧠 Тактический план (AI)\n")
+                md_content.append("### 🛡️ Добивающие (Резерв)")
+                md_content.append(", ".join(dobivators_names))
+                md_content.append("*Эти игроки ждут недобитые базы.*\n")
+                
+                # Таблицы
+                md_content.append("## 1️⃣ Основной удар\n")
+                md_content.append("```text")
+                md_content.append(str(table_1))
+                md_content.append("```\n")
+                
+                if second_strike_plan:
+                    md_content.append("## 2️⃣ Добивание и набивка\n")
+                    md_content.append("```text")
+                    md_content.append(str(table_2))
+                    md_content.append("```")
+                
+                # Записываем файл
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(md_content))
+                
+                # Отправляем документ
+                if isinstance(update, types.Message):
+                    await update.answer_document(
+                        FSInputFile(filename),
+                        caption=f"📁 Полный отчет войны {our_clan.name} vs {enemy_clan.name}"
+                    )
+                else:
+                    await update.message.answer_document(
+                        FSInputFile(filename),
+                        caption=f"📁 Полный отчет войны {our_clan.name} vs {enemy_clan.name}"
+                    )
                     
             except Exception as e:
-                logger.error(f"Error saving report: {e}")
+                logger.error(f"Error saving report: {e}", exc_info=True)
+                await send_msg(update, f"❌ Ошибка генерации отчета: {str(e)[:100]}")
 
     except coc.PrivateWarLog:
         await send_msg(update, "🔒 Лог войны закрыт настройками клана.")
@@ -502,14 +621,19 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery, generate_
         await send_msg(update, f"❌ Ошибка формирования плана: {str(e)[:100]}")
 
 async def handle_remind_full(update: types.Message | types.CallbackQuery):
+    clan_tag = await check_user_clan(update)
+    if not clan_tag:
+        return
+        
     if not coc_client: return
     try:
-        war = await coc_client.get_current_war(CLAN_TAG)
+        war = await coc_client.get_current_war(clan_tag)
         if war.state == "notInWar":
             await send_msg(update, "🔍 Войны нет.")
             return
 
-        tg_mapping = get_linked_accounts_db()
+        tg_id = await get_tg_id(update)
+        tg_mapping = get_linked_accounts_db(tg_id)
         zero_attacks = []
         one_attack = []
 
@@ -542,9 +666,13 @@ async def handle_remind_full(update: types.Message | types.CallbackQuery):
         await send_msg(update, "❌ Ошибка напоминания.")
 
 async def handle_attack_logs(update: types.Message | types.CallbackQuery):
+    clan_tag = await check_user_clan(update)
+    if not clan_tag:
+        return
+        
     if not coc_client: return
     try:
-        war = await coc_client.get_current_war(CLAN_TAG)
+        war = await coc_client.get_current_war(clan_tag)
         if war.state == "notInWar":
             await send_msg(update, "🔍 Войны нет.")
             return
@@ -595,10 +723,20 @@ async def send_msg(update: types.Message | types.CallbackQuery, text: str, parse
 # ============================================================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    tg_id = message.from_user.id
+    active_clan = get_user_active_clan(tg_id)
+    
     text = (f"👋 Привет, {message.from_user.first_name}!\n\n"
-            f"🤖 Я Clash Assistant с AI-подбором целей.\n"
-            f"Выбери раздел в меню ниже:")
-    await message.answer(text, reply_markup=get_main_menu())
+            f"🤖 Я Clash Assistant с AI-подбором целей.\n")
+    
+    if active_clan:
+        text += f"🏰 Активный клан: <code>{active_clan}</code>\n\n"
+        text += "Выбери раздел в меню:"
+        await message.answer(text, parse_mode="HTML", reply_markup=get_main_menu())
+    else:
+        text += "⚠️ У вас не выбран активный клан.\n"
+        text += "Привяжите аккаунт: /link"
+        await message.answer(text, parse_mode="HTML")
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
@@ -616,6 +754,29 @@ async def cmd_clan(message: types.Message):
 async def cmd_profile(message: types.Message):
     await message.answer("👤 <b>Раздел ПРОФИЛЬ:</b>", parse_mode="HTML", reply_markup=get_profile_menu())
 
+@dp.message(Command("switch_clan"))
+async def cmd_switch_clan(message: types.Message):
+    tg_id = message.from_user.id
+    clans = get_all_user_clans(tg_id)
+    
+    if not clans:
+        await message.answer("🔗 У вас нет привязанных аккаунтов.\nИспользуйте /link для привязки.")
+        return
+    
+    kb_buttons = []
+    for clan_tag, count in clans:
+        kb_buttons.append([InlineKeyboardButton(
+            text=f"{clan_tag} ({count} акк.)",
+            callback_data=f"set_clan_{clan_tag}"
+        )])
+    kb_buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="back_main")])
+    
+    await message.answer(
+        "🔄 <b>Выберите активный клан:</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+    )
+
 # ============================================================
 # 🔗 ПРИВЯЗКА АККАУНТА (FSM)
 # ============================================================
@@ -631,6 +792,7 @@ async def cmd_link(update: types.Message | types.CallbackQuery, state: FSMContex
     await msg.answer(
         "🔗 <b>Привязка аккаунта</b>\n\n"
         "Отправьте ваш тег игрока (например, <code>#2Y8QV9JQ</code>).\n"
+        "Бот автоматически определит ваш клан.\n"
         "Для отмены: /cancel",
         parse_mode="HTML"
     )
@@ -657,7 +819,19 @@ async def process_tag(message: types.Message, state: FSMContext):
 
     try:
         player = await coc_client.get_player(tag)
-        await state.update_data(player_tag=tag, player_name=player.name)
+        
+        # Получаем клан игрока
+        clan_tag = None
+        if player.clan:
+            clan_tag = player.clan.tag
+        
+        await state.update_data(
+            player_tag=tag,
+            player_name=player.name,
+            clan_tag=clan_tag
+        )
+        
+        clan_info = f"🏰 Клан: <code>{clan_tag}</code>" if clan_tag else "⚠️ Игрок не в клане"
         
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Да, это я", callback_data="confirm_link_yes")],
@@ -665,7 +839,8 @@ async def process_tag(message: types.Message, state: FSMContext):
         ])
         await message.answer(
             f"🔍 Найден игрок: <b>{player.name}</b> (ТХ{player.town_hall})\n"
-            f"Тег: <code>{tag}</code>\n\n"
+            f"Тег: <code>{tag}</code>\n"
+            f"{clan_info}\n\n"
             f"Это ваш аккаунт? Подтвердите:",
             parse_mode="HTML", reply_markup=kb
         )
@@ -683,11 +858,23 @@ async def confirm_yes(callback: types.CallbackQuery, state: FSMContext):
     tg_id = callback.from_user.id
     tg_username = callback.from_user.username or ""
     
-    link_account_db(tg_id, tg_username, data['player_tag'], data['player_name'])
+    clan_tag = data.get('clan_tag', '')
+    
+    if not clan_tag:
+        await callback.message.edit_text(
+            "⚠️ Игрок не состоит в клане. Привязка невозможна.",
+            parse_mode="HTML"
+        )
+        await state.clear()
+        return
+    
+    link_account_db(tg_id, tg_username, data['player_tag'], data['player_name'], clan_tag)
     
     await callback.message.edit_text(
         f"✅ Аккаунт <b>{data['player_name']}</b> привязан!\n"
-        f"Теперь ваш @username будет в отчетах.",
+        f"🏰 Клан: <code>{clan_tag}</code>\n"
+        f"Теперь ваш @username будет в отчетах.\n"
+        f"Этот клан установлен как активный.",
         parse_mode="HTML"
     )
     await state.clear()
@@ -706,6 +893,17 @@ async def cb_back_main(callback: types.CallbackQuery):
     await callback.message.delete()
     await cmd_start(callback.message)
 
+@dp.callback_query(F.data.startswith("set_clan_"))
+async def cb_set_clan(callback: types.CallbackQuery):
+    clan_tag = callback.data.replace("set_clan_", "")
+    tg_id = callback.from_user.id
+    
+    set_user_active_clan(tg_id, clan_tag)
+    
+    await callback.answer(f"✅ Активный клан: {clan_tag}", show_alert=True)
+    await callback.message.delete()
+    await cmd_start(callback.message)
+
 @dp.callback_query(F.data == "menu_war")
 async def cb_menu_war(callback: types.CallbackQuery):
     await callback.answer()
@@ -720,6 +918,12 @@ async def cb_menu_clan(callback: types.CallbackQuery):
 async def cb_menu_profile(callback: types.CallbackQuery):
     await callback.answer()
     await callback.message.edit_text("👤 <b>Раздел ПРОФИЛЬ:</b>", parse_mode="HTML", reply_markup=get_profile_menu())
+
+@dp.callback_query(F.data == "switch_clan")
+async def cb_switch_clan(callback: types.CallbackQuery):
+    await callback.answer()
+    await callback.message.delete()
+    await cmd_switch_clan(callback.message)
 
 @dp.callback_query(F.data == "clan_info")
 async def cb_clan(callback: types.CallbackQuery):
@@ -755,8 +959,9 @@ async def cb_my_accounts(callback: types.CallbackQuery):
         return
         
     text = "👤 <b>Ваши привязанные аккаунты:</b>\n\n"
-    for name, tag in accounts:
+    for name, tag, clan_tag in accounts:
         text += f"• {name} (<code>{tag}</code>)\n"
+        text += f"  🏰 Клан: <code>{clan_tag}</code>\n\n"
         
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_back_keyboard("menu_profile"))
 
