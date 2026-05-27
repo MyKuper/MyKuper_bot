@@ -2,6 +2,7 @@ import os
 import logging
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web
 import coc
 from prettytable import PrettyTable
