@@ -11,9 +11,8 @@ from prettytable import PrettyTable
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 COC_EMAIL = os.getenv('COC_EMAIL')
 COC_PASSWORD = os.getenv('COC_PASSWORD')
-CLAN_TAG = "#2CY00G2VU"  # 👈 ТЕГ ВАШЕГО КЛАНА (с решёткой)
+CLAN_TAG = "#2CY00G2VU"  # 👈 ТЕГ ВАШЕГО КЛАНА
 
-# Прокси для COC API (обязательно для Render)
 PROXY = "http://45.79.218.79:80"
 
 logging.basicConfig(level=logging.INFO)
@@ -21,8 +20,6 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
-
-# Глобальная переменная для клиента COC
 coc_client = None
 
 # ------------------------------------------------------------
@@ -49,7 +46,7 @@ async def cmd_help(message: types.Message):
 @dp.message(Command("clan"))
 async def cmd_clan(message: types.Message):
     if coc_client is None:
-        await message.answer("❌ Клиент COC ещё не инициализирован. Попробуйте через минуту.")
+        await message.answer("❌ Клиент COC ещё не инициализирован.")
         return
     try:
         clan = await coc_client.get_clan(CLAN_TAG)
@@ -63,7 +60,7 @@ async def cmd_clan(message: types.Message):
         )
         await message.answer(text, parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"Ошибка /clan: {e}", exc_info=True)
+        logger.error(f"Ошибка /clan: {e}")
         await message.answer("❌ Не удалось получить информацию о клане.")
 
 @dp.message(Command("members"))
@@ -82,7 +79,7 @@ async def cmd_members(message: types.Message):
             table.add_row([m.name, role, m.town_hall, m.trophies])
         await message.answer(f"<pre><code>{table}</code></pre>", parse_mode="HTML")
     except Exception as e:
-        logger.error(f"Ошибка /members: {e}", exc_info=True)
+        logger.error(f"Ошибка /members: {e}")
         await message.answer("❌ Не удалось получить список участников.")
 
 @dp.message(Command("war"))
@@ -92,13 +89,10 @@ async def cmd_war(message: types.Message):
         return
     try:
         war = await coc_client.get_current_war(CLAN_TAG)
-        logger.info(f"Статус войны: {war.state}")  # Для отладки
-
         if war.state == "notInWar":
-            await message.answer("🔍 Клан не участвует в войне в данный момент.")
+            await message.answer("🔍 Клан не участвует в войне.")
             return
 
-        # Основная информация
         our_clan = war.clan
         enemy_clan = war.opponent
         text = (
@@ -108,11 +102,9 @@ async def cmd_war(message: types.Message):
             f"🏆 Процент разрушения: {our_clan.destruction}%\n\n"
         )
 
-        # Сортируем участников по уровню ратуши
         our_members = sorted(war.members, key=lambda m: m.town_hall, reverse=True)
         enemy_members = sorted(war.opponent.members, key=lambda m: m.town_hall, reverse=True)
 
-        # Таблица соответствия
         table = PrettyTable()
         table.field_names = ["Атакующий (ТХ)", "Противник (ТХ)", "Рекомендация"]
         for our, enemy in zip(our_members, enemy_members):
@@ -123,23 +115,20 @@ async def cmd_war(message: types.Message):
                 recommendation = "⚠️ Тяжелая цель"
             table.add_row([f"{our.name} ({our.town_hall})", f"{enemy.name} ({enemy.town_hall})", recommendation])
 
-        # Неиспользованные атаки
-        unused_attacks = [m for m in war.members if m.attacks_used < m.attacks_per_member]
-        unused_text = ""
+        # Исправлено: количество атак — через len(m.attacks)
+        unused_attacks = [m for m in war.members if len(m.attacks) < war.attacks_per_member]
         if unused_attacks:
-            unused_text = "\n⚠️ **Остались атаки:**\n" + "\n".join([f"• {m.name} ({m.attacks_used}/{m.attacks_per_member})" for m in unused_attacks])
+            unused_text = "\n⚠️ **Остались атаки:**\n" + "\n".join([f"• {m.name} ({len(m.attacks)}/{war.attacks_per_member})" for m in unused_attacks])
         else:
             unused_text = "\n✅ Все атаки использованы!"
 
         await message.answer(text + f"<pre><code>{table}</code></pre>" + unused_text, parse_mode="Markdown")
 
     except coc.PrivateWarLog:
-        await message.answer("🔒 Лог войны клана закрыт. Невозможно получить данные.")
-    except coc.NotFound:
-        await message.answer("❌ Клан не найден или не участвует в войне. Проверьте тег.")
+        await message.answer("🔒 Лог войны клана закрыт.")
     except Exception as e:
-        logger.error(f"Ошибка /war: {e}", exc_info=True)
-        await message.answer(f"❌ Ошибка получения данных о войне: {str(e)[:100]}. Проверьте логи.")
+        logger.error(f"Ошибка /war: {e}")
+        await message.answer("❌ Не удалось получить данные о войне.")
 
 @dp.message(Command("player"))
 async def cmd_player(message: types.Message):
@@ -163,7 +152,7 @@ async def cmd_player(message: types.Message):
         )
         await message.answer(text, parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"Ошибка /player: {e}", exc_info=True)
+        logger.error(f"Ошибка /player: {e}")
         await message.answer("❌ Игрок не найден. Проверьте тег (начинается с #).")
 
 @dp.message(Command("remind"))
@@ -174,24 +163,22 @@ async def cmd_remind(message: types.Message):
     try:
         war = await coc_client.get_current_war(CLAN_TAG)
         if war.state == "notInWar":
-            await message.answer("🔍 Клан не в войне, напоминать не о чем.")
+            await message.answer("🔍 Клан не в войне.")
             return
-        unused = [m for m in war.members if m.attacks_used < m.attacks_per_member]
+        unused = [m for m in war.members if len(m.attacks) < war.attacks_per_member]
         if not unused:
             await message.answer("✅ Все атаки уже использованы!")
         else:
             remind_text = "⚔️ **У кого остались атаки:**\n"
             for m in unused:
-                remind_text += f"• {m.name}: {m.attacks_used}/{m.attacks_per_member}\n"
+                remind_text += f"• {m.name}: {len(m.attacks)}/{war.attacks_per_member}\n"
             await message.answer(remind_text, parse_mode="Markdown")
-    except coc.PrivateWarLog:
-        await message.answer("🔒 Лог войны закрыт, не могу проверить атаки.")
     except Exception as e:
-        logger.error(f"Ошибка /remind: {e}", exc_info=True)
-        await message.answer(f"❌ Не удалось проверить атаки: {str(e)[:100]}")
+        logger.error(f"Ошибка /remind: {e}")
+        await message.answer("❌ Не удалось проверить атаки.")
 
 # ------------------------------------------------------------
-# Инициализация COC клиента и запуск веб-сервера
+# Запуск сервера и инициализация COC
 # ------------------------------------------------------------
 async def on_startup(app: web.Application):
     global coc_client
@@ -199,30 +186,29 @@ async def on_startup(app: web.Application):
     try:
         coc_client = coc.Client(client=coc.EventsClient, proxy=PROXY)
         await coc_client.login(COC_EMAIL, COC_PASSWORD)
-        logger.info("Клиент COC успешно создан и авторизован")
+        logger.info("Клиент COC авторизован")
     except Exception as e:
-        logger.error(f"Ошибка при создании клиента COC: {e}", exc_info=True)
+        logger.error(f"Ошибка COC: {e}")
         coc_client = None
 
     webhook_url = os.getenv('RENDER_EXTERNAL_URL')
     if webhook_url:
         await bot.set_webhook(f"{webhook_url}/webhook")
-        logger.info(f"Webhook установлен на {webhook_url}/webhook")
+        logger.info(f"Webhook: {webhook_url}/webhook")
     else:
-        logger.error("RENDER_EXTERNAL_URL не задана! Вебхук не будет работать.")
+        logger.error("RENDER_EXTERNAL_URL не задана")
 
 async def on_shutdown(app: web.Application):
     global coc_client
-    logger.info("Завершение работы приложения...")
     if coc_client:
         await coc_client.close()
     await bot.session.close()
 
 def main():
     app = web.Application()
-    webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
-    webhook_handler.register(app, path="/webhook")
-    app.router.add_get("/health", lambda request: web.Response(text="OK"))
+    handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
+    handler.register(app, path="/webhook")
+    app.router.add_get("/health", lambda req: web.Response(text="OK"))
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
     port = int(os.environ.get('PORT', 8080))
