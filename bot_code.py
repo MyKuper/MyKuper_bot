@@ -51,7 +51,6 @@ async def init_db():
         logger.info("✅ Подключение к PostgreSQL установлено")
         
         async with db_pool.acquire() as conn:
-            # Таблица пользователей
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     tg_id BIGINT PRIMARY KEY,
@@ -61,7 +60,6 @@ async def init_db():
                 )
             ''')
             
-            # Таблица привязанных аккаунтов
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS linked_accounts (
                     id SERIAL PRIMARY KEY,
@@ -74,7 +72,6 @@ async def init_db():
                 )
             ''')
             
-            # Таблица активных кланов
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS user_active_clan (
                     tg_id BIGINT PRIMARY KEY REFERENCES users(tg_id),
@@ -96,13 +93,11 @@ async def link_account_db(tg_id: int, tg_username: str, player_tag: str, player_
     
     try:
         async with db_pool.acquire() as conn:
-            # Сохраняем/обновляем пользователя
             await conn.execute('''
                 INSERT INTO users (tg_id, tg_username) VALUES ($1, $2)
                 ON CONFLICT (tg_id) DO UPDATE SET tg_username = EXCLUDED.tg_username
             ''', tg_id, tg_username)
             
-            # Сохраняем аккаунт
             await conn.execute('''
                 INSERT INTO linked_accounts (tg_id, player_tag, player_name, clan_tag)
                 VALUES ($1, $2, $3, $4)
@@ -110,7 +105,6 @@ async def link_account_db(tg_id: int, tg_username: str, player_tag: str, player_
                 DO UPDATE SET player_name = EXCLUDED.player_name, clan_tag = EXCLUDED.clan_tag
             ''', tg_id, player_tag, player_name, clan_tag)
             
-            # Устанавливаем активный клан
             await conn.execute('''
                 INSERT INTO user_active_clan (tg_id, clan_tag) VALUES ($1, $2)
                 ON CONFLICT (tg_id) DO UPDATE SET clan_tag = EXCLUDED.clan_tag, updated_at = CURRENT_TIMESTAMP
@@ -120,6 +114,35 @@ async def link_account_db(tg_id: int, tg_username: str, player_tag: str, player_
             return True
     except Exception as e:
         logger.error(f"❌ Ошибка привязки: {e}")
+        return False
+
+async def unlink_account_db(tg_id: int, player_tag: str):
+    """Удаляет привязанный аккаунт"""
+    if not db_pool:
+        return False
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                'DELETE FROM linked_accounts WHERE tg_id = $1 AND player_tag = $2',
+                tg_id, player_tag
+            )
+            
+            row = await conn.fetchrow(
+                'SELECT clan_tag FROM linked_accounts WHERE tg_id = $1 LIMIT 1',
+                tg_id
+            )
+            if row:
+                await conn.execute('''
+                    INSERT INTO user_active_clan (tg_id, clan_tag) VALUES ($1, $2)
+                    ON CONFLICT (tg_id) DO UPDATE SET clan_tag = EXCLUDED.clan_tag, updated_at = CURRENT_TIMESTAMP
+                ''', tg_id, row['clan_tag'])
+            else:
+                await conn.execute('DELETE FROM user_active_clan WHERE tg_id = $1', tg_id)
+            
+            logger.info(f"🗑 Отвязан: {player_tag} для {tg_id}")
+            return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка отвязки: {e}")
         return False
 
 async def set_user_active_clan(tg_id: int, clan_tag: str):
@@ -135,6 +158,18 @@ async def set_user_active_clan(tg_id: int, clan_tag: str):
             return True
     except Exception as e:
         logger.error(f"❌ Ошибка смены клана: {e}")
+        return False
+
+async def clear_active_clan(tg_id: int):
+    """Удаляет активный клан (сброс)"""
+    if not db_pool:
+        return False
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute('DELETE FROM user_active_clan WHERE tg_id = $1', tg_id)
+            return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка сброса клана: {e}")
         return False
 
 async def get_user_active_clan(tg_id: int) -> Optional[str]:
@@ -199,7 +234,6 @@ dp = Dispatcher(storage=storage)
 coc_client: Optional[coc.Client] = None
 scheduler = AsyncIOScheduler()
 
-# Анти-спам
 _last_clicks = {}
 
 def check_click_throttle(user_id: int, action: str) -> bool:
@@ -241,6 +275,15 @@ async def check_user_clan(update) -> Optional[str]:
             parse_mode="HTML")
         return None
     return clan_tag
+
+async def send_msg(update, text: str, parse_mode=None, reply_markup=None):
+    try:
+        if isinstance(update, types.Message):
+            await update.answer(text, parse_mode=parse_mode, reply_markup=reply_markup, disable_web_page_preview=True)
+        else:
+            await update.message.answer(text, parse_mode=parse_mode, reply_markup=reply_markup, disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"Send error: {e}")
 
 # ============================================================
 # ⌨️ МЕНЮ
@@ -285,6 +328,7 @@ def get_profile_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Моя статистика", callback_data="my_stats")],
         [InlineKeyboardButton(text="🎮 Мои аккаунты", callback_data="my_accounts")],
+        [InlineKeyboardButton(text="🗑 Удалить активный клан", callback_data="clear_active_clan")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_main")],
     ])
 
@@ -767,15 +811,6 @@ async def handle_attack_logs(update):
     except Exception as e:
         await send_msg(update, "❌ Ошибка.")
 
-async def send_msg(update, text: str, parse_mode=None, reply_markup=None):
-    try:
-        if isinstance(update, types.Message):
-            await update.answer(text, parse_mode=parse_mode, reply_markup=reply_markup, disable_web_page_preview=True)
-        else:
-            await update.message.answer(text, parse_mode=parse_mode, reply_markup=reply_markup, disable_web_page_preview=True)
-    except Exception as e:
-        logger.error(f"Send error: {e}")
-
 # ============================================================
 # 🔔 АВТО-УВЕДОМЛЕНИЯ
 # ============================================================
@@ -844,7 +879,7 @@ async def cmd_start(message: types.Message):
         text += f"🏰 Клан: <code>{active_clan}</code>\n\nВыбери раздел:"
         await message.answer(text, parse_mode="HTML", reply_markup=get_main_menu())
     else:
-        text += "⚠️ Клан не выбран.\n\n🔗 /link - привязать аккаунт\n🎯 /set_clan - указать клан"
+        text += "⚠️ Клан не выбран.\n\n🔗 /link - привязать аккаунт\n🎯 /set_clan - указать клан\n🗑 /unlink - управление аккаунтами"
         await message.answer(text, parse_mode="HTML")
 
 @dp.message(Command("help"))
@@ -969,6 +1004,124 @@ async def confirm_no(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text("❌ Отменено.")
     await state.clear()
 
+# ============================================================
+# 🗑 УПРАВЛЕНИЕ АККАУНТАМИ
+# ============================================================
+@dp.message(Command("unlink"))
+async def cmd_unlink(message: types.Message):
+    """Быстрая отвязка аккаунтов"""
+    if message.from_user.is_bot: return
+    
+    accounts = await get_user_accounts_db(message.from_user.id)
+    
+    if not accounts:
+        await message.answer("🔗 У вас нет привязанных аккаунтов.\n/link - чтобы привязать.")
+        return
+    
+    kb_buttons = []
+    text = "🗑 <b>Выберите аккаунт для удаления:</b>\n\n"
+    
+    for a in accounts:
+        text += f"• {a['player_name']} (<code>{a['player_tag']}</code>)\n"
+        kb_buttons.append([InlineKeyboardButton(
+            text=f"🗑 {a['player_name']}",
+            callback_data=f"unlink_{a['player_tag']}"
+        )])
+    
+    kb_buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="back_main")])
+    
+    await message.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
+
+@dp.callback_query(F.data.startswith("unlink_"))
+async def cb_unlink_request(callback: types.CallbackQuery):
+    """Запрашивает подтверждение удаления"""
+    player_tag = callback.data.replace("unlink_", "")
+    
+    accounts = await get_user_accounts_db(callback.from_user.id)
+    player_name = "Неизвестно"
+    for a in accounts:
+        if a['player_tag'] == player_tag:
+            player_name = a['player_name']
+            break
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"confirm_unlink_{player_tag}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="my_accounts")],
+    ])
+    
+    await callback.message.edit_text(
+        f"⚠️ <b>Подтверждение удаления</b>\n\n"
+        f"Удалить аккаунт <b>{player_name}</b> (<code>{player_tag}</code>)?\n\n"
+        f"Это действие нельзя отменить!",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("confirm_unlink_"))
+async def cb_unlink_confirm(callback: types.CallbackQuery):
+    """Подтверждает и выполняет удаление"""
+    player_tag = callback.data.replace("confirm_unlink_", "")
+    success = await unlink_account_db(callback.from_user.id, player_tag)
+    
+    if success:
+        await callback.answer("✅ Аккаунт удален!", show_alert=True)
+    else:
+        await callback.answer("❌ Ошибка удаления", show_alert=True)
+    
+    await cb_my_accs(callback)
+
+@dp.callback_query(F.data.startswith("set_active_"))
+async def cb_set_active_clan(callback: types.CallbackQuery):
+    """Устанавливает активный клан по тегу игрока"""
+    player_tag = callback.data.replace("set_active_", "")
+    accounts = await get_user_accounts_db(callback.from_user.id)
+    
+    clan_tag = None
+    for a in accounts:
+        if a['player_tag'] == player_tag:
+            clan_tag = a['clan_tag']
+            break
+    
+    if clan_tag:
+        await set_user_active_clan(callback.from_user.id, clan_tag)
+        await callback.answer(f"✅ Активный клан: {clan_tag}", show_alert=True)
+    else:
+        await callback.answer("❌ Клан не найден", show_alert=True)
+    
+    await cb_my_accs(callback)
+
+@dp.callback_query(F.data == "clear_active_clan")
+async def cb_clear_active_clan(callback: types.CallbackQuery):
+    """Сбрасывает активный клан"""
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, сбросить", callback_data="confirm_clear_clan")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="menu_profile")],
+    ])
+    
+    await callback.message.edit_text(
+        "⚠️ <b>Сброс активного клана</b>\n\n"
+        "Вы уверены? Вам придётся заново выбрать клан для работы бота.",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "confirm_clear_clan")
+async def cb_confirm_clear_clan(callback: types.CallbackQuery):
+    success = await clear_active_clan(callback.from_user.id)
+    
+    if success:
+        await callback.message.edit_text(
+            "✅ Активный клан сброшен.\n\n"
+            "Используйте /link или /set_clan чтобы выбрать новый.",
+            parse_mode="HTML",
+            reply_markup=get_back_keyboard("menu_profile")
+        )
+    else:
+        await callback.message.edit_text("❌ Ошибка сброса.")
+    await callback.answer()
+
 @dp.message(Command("debug"))
 async def cmd_debug(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -977,16 +1130,34 @@ async def cmd_debug(message: types.Message):
     active = await get_user_active_clan(tg_id)
     accs = await get_user_accounts_db(tg_id)
     db_status = "✅" if db_pool else "❌"
+    
+    total_users = 0
+    total_accs = 0
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                total_users = await conn.fetchval('SELECT COUNT(*) FROM users')
+                total_accs = await conn.fetchval('SELECT COUNT(*) FROM linked_accounts')
+        except:
+            pass
+    
     text = (
-        f"🔧 <b>DEBUG</b>\n\n"
-        f"💾 PostgreSQL: {db_status}\n\n"
-        f"👤 <b>Вы:</b>\n"
-        f"   Клан: <code>{active or 'НЕТ'}</code>\n"
+        f"🔧 <b>DEBUG INFO</b>\n\n"
+        f"💾 PostgreSQL: {db_status}\n"
+        f"👥 Всего пользователей: <code>{total_users}</code>\n"
+        f"🔗 Всего привязок: <code>{total_accs}</code>\n\n"
+        f"👤 <b>Ваши данные:</b>\n"
+        f"   Активный клан: <code>{active or 'НЕТ'}</code>\n"
         f"   Аккаунтов: <code>{len(accs)}</code>\n"
     )
     for a in accs:
-        text += f"   • {a['player_name']} ({a['player_tag']})\n"
-    await message.answer(text, parse_mode="HTML")
+        text += f"   • {a['player_name']} (<code>{a['player_tag']}</code>) → <code>{a['clan_tag']}</code>\n"
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎮 Мои аккаунты", callback_data="my_accounts")],
+        [InlineKeyboardButton(text="◀️ В меню", callback_data="back_main")],
+    ])
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 # ============================================================
 # 🔄 CALLBACKS
@@ -1071,13 +1242,44 @@ async def cb_stats(callback: types.CallbackQuery):
 async def cb_my_accs(callback: types.CallbackQuery):
     await callback.answer()
     accounts = await get_user_accounts_db(callback.from_user.id)
+    active_clan = await get_user_active_clan(callback.from_user.id)
+    
     if not accounts:
-        await callback.message.edit_text("🔗 Нет аккаунтов. /link", reply_markup=get_back_keyboard("menu_profile"))
+        await callback.message.edit_text(
+            "🔗 <b>Нет привязанных аккаунтов.</b>\n\nИспользуйте /link для привязки.",
+            parse_mode="HTML",
+            reply_markup=get_back_keyboard("menu_profile")
+        )
         return
-    text = "👤 <b>Ваши аккаунты:</b>\n\n"
+    
+    text = f"👤 <b>Ваши аккаунты ({len(accounts)}):</b>\n\n"
+    text += f"🏰 <b>Активный клан:</b> <code>{active_clan or 'НЕТ'}</code>\n\n"
+    
+    kb_buttons = []
     for a in accounts:
-        text += f"• {a['player_name']} (<code>{a['player_tag']}</code>)\n  🏰 <code>{a['clan_tag']}</code>\n\n"
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_back_keyboard("menu_profile"))
+        text += f"• <b>{a['player_name']}</b>\n"
+        text += f"  Тег: <code>{a['player_tag']}</code>\n"
+        text += f"  Клан: <code>{a['clan_tag']}</code>\n\n"
+        
+        if a['clan_tag'] != active_clan:
+            kb_buttons.append([InlineKeyboardButton(
+                text=f"🎯 Активный: {a['player_name']}",
+                callback_data=f"set_active_{a['player_tag']}"
+            )])
+        
+        kb_buttons.append([InlineKeyboardButton(
+            text=f"🗑 Удалить: {a['player_name']}",
+            callback_data=f"unlink_{a['player_tag']}"
+        )])
+    
+    kb_buttons.append([InlineKeyboardButton(text="➕ Привязать ещё", callback_data="link_account")])
+    kb_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="menu_profile")])
+    
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+    )
 
 @dp.callback_query(F.data == "war_plan")
 async def cb_war(callback: types.CallbackQuery):
@@ -1120,12 +1322,9 @@ async def on_startup(app: web.Application):
         await bot.set_webhook(f"{webhook_url}/webhook")
         logger.info(f"🌐 Webhook: {webhook_url}/webhook")
     
-    # Инициализация PostgreSQL
     await init_db()
-    
     await init_coc_client()
     
-    # Авто-уведомления
     scheduler.add_job(auto_war_reminders, 'interval', minutes=30, id='war_reminders')
     scheduler.start()
     logger.info("🔔 Авто-уведомления запущены (каждые 30 мин)")
