@@ -11,9 +11,9 @@ from prettytable import PrettyTable
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 COC_EMAIL = os.getenv('COC_EMAIL')
 COC_PASSWORD = os.getenv('COC_PASSWORD')
-CLAN_TAG = "#2CY00G2VU" # 👈 НЕ ЗАБУДЬТЕ ЗАМЕНИТЬ НА ТЕГ ВАШЕГО КЛАНА!
+CLAN_TAG = "#2CY00G2VU"  # 👈 Укажите тег вашего клана
 
-# Прокси для COC API (обязательно для работы на Render)
+# Прокси для COC API (обязательно для Render)
 PROXY = "http://45.79.218.79:80"
 
 logging.basicConfig(level=logging.INFO)
@@ -22,16 +22,11 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-# Создаём клиент COC
-coc_client = coc.login(
-    COC_EMAIL,
-    COC_PASSWORD,
-    client=coc.EventsClient,
-    proxy=PROXY
-)
+# Глобальная переменная для клиента COC (будет инициализирована при старте)
+coc_client = None
 
 # ------------------------------------------------------------
-# Обработчики команд (они остаются без изменений)
+# Обработчики команд (используют coc_client)
 # ------------------------------------------------------------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -53,6 +48,9 @@ async def cmd_help(message: types.Message):
 
 @dp.message(Command("clan"))
 async def cmd_clan(message: types.Message):
+    if coc_client is None:
+        await message.answer("❌ Клиент COC ещё не инициализирован. Попробуйте через минуту.")
+        return
     try:
         clan = await coc_client.get_clan(CLAN_TAG)
         text = (
@@ -70,6 +68,9 @@ async def cmd_clan(message: types.Message):
 
 @dp.message(Command("members"))
 async def cmd_members(message: types.Message):
+    if coc_client is None:
+        await message.answer("❌ Клиент COC ещё не инициализирован.")
+        return
     try:
         clan = await coc_client.get_clan(CLAN_TAG)
         members = clan.members
@@ -86,6 +87,9 @@ async def cmd_members(message: types.Message):
 
 @dp.message(Command("war"))
 async def cmd_war(message: types.Message):
+    if coc_client is None:
+        await message.answer("❌ Клиент COC ещё не инициализирован.")
+        return
     try:
         war = await coc_client.get_current_war(CLAN_TAG)
         if war.state == "notInWar":
@@ -121,6 +125,9 @@ async def cmd_war(message: types.Message):
 
 @dp.message(Command("player"))
 async def cmd_player(message: types.Message):
+    if coc_client is None:
+        await message.answer("❌ Клиент COC ещё не инициализирован.")
+        return
     args = message.text.split()
     if len(args) < 2:
         await message.answer("❌ Укажите тег игрока, например: `/player #ABC123`", parse_mode="Markdown")
@@ -143,6 +150,9 @@ async def cmd_player(message: types.Message):
 
 @dp.message(Command("remind"))
 async def cmd_remind(message: types.Message):
+    if coc_client is None:
+        await message.answer("❌ Клиент COC ещё не инициализирован.")
+        return
     try:
         war = await coc_client.get_current_war(CLAN_TAG)
         if war.state == "notInWar":
@@ -161,32 +171,47 @@ async def cmd_remind(message: types.Message):
         await message.answer("❌ Не удалось проверить атаки.")
 
 # ------------------------------------------------------------
-# Основная функция для запуска бота через вебхук
+# Инициализация клиента COC и запуск веб-сервера
 # ------------------------------------------------------------
 async def on_startup():
-    """Устанавливает вебхук при запуске приложения."""
+    """Асинхронная инициализация при старте приложения."""
+    global coc_client
+    logger.info("Инициализация клиента COC...")
+    try:
+        coc_client = await coc.login(
+            COC_EMAIL,
+            COC_PASSWORD,
+            client=coc.EventsClient,
+            proxy=PROXY
+        )
+        logger.info("Клиент COC успешно создан")
+    except Exception as e:
+        logger.error(f"Ошибка при создании клиента COC: {e}")
+        # Продолжаем работу, но команды COC будут недоступны
+        coc_client = None
+
+    # Устанавливаем вебхук
     webhook_url = os.getenv('RENDER_EXTERNAL_URL')
     if webhook_url:
         await bot.set_webhook(f"{webhook_url}/webhook")
-        logger.info(f"Webhook set to {webhook_url}/webhook")
+        logger.info(f"Webhook установлен на {webhook_url}/webhook")
     else:
-        logger.error("RENDER_EXTERNAL_URL not set!")
+        logger.error("RENDER_EXTERNAL_URL не задана! Вебхук не будет работать.")
 
 def main():
-    """Запускает aiohttp сервер, который слушает вебхуки от Telegram."""
+    """Запуск aiohttp сервера с вебхуками."""
     app = web.Application()
     
     # Подключаем обработчик вебхуков от aiogram
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     webhook_handler.register(app, path="/webhook")
     
-    # Регистрируем обработчик проверки здоровья для Render
+    # Эндпоинт для проверки здоровья (health check)
     app.router.add_get("/health", lambda request: web.Response(text="OK"))
     
-    # Устанавливаем функцию, которая выполнится при старте приложения
+    # Добавляем функцию инициализации при старте приложения
     app.on_startup.append(on_startup)
     
-    # Запускаем веб-сервер
     port = int(os.environ.get('PORT', 8080))
     web.run_app(app, host='0.0.0.0', port=port)
 
