@@ -1,3 +1,4 @@
-aiogram==3.23.0
-coc.py>=3.9.1
-aiohttp>=3.10.0
+aiogram>=3.23.0
+coc.py>=4.0.0
+aiohttp
+prettytable
