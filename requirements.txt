@@ -1,4 +1,3 @@
 aiogram==3.17.0
 coc.py==3.3.4
 aiohttp
-python-3.11.10
