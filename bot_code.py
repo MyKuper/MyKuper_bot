@@ -10,7 +10,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFil
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.sqlite import SQLiteStorage
+from aiogram.fsm.storage.memory import MemoryStorage  # ✅ Только MemoryStorage
 from aiohttp import web
 import coc
 from prettytable import PrettyTable
@@ -116,8 +116,9 @@ def get_all_user_clans(tg_id) -> List[tuple]:
 # 🤖 ИНИЦИАЛИЗАЦИЯ
 # ============================================================
 bot = Bot(token=TELEGRAM_TOKEN)
-# SQLiteStorage сохраняет FSM состояния при перезапуске!
-storage = SQLiteStorage(DB_FILE)
+# MemoryStorage - FSM состояния (ожидание ввода) не сохраняются при рестарте,
+# но это не критично. Главное - БД с привязками (bot_data.db) сохраняется.
+storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 coc_client: Optional[coc.Client] = None
 
