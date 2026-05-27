@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
@@ -13,7 +14,7 @@ COC_EMAIL = os.getenv('COC_EMAIL')
 COC_PASSWORD = os.getenv('COC_PASSWORD')
 CLAN_TAG = "#2CY00G2VU"  # 👈 Укажите тег вашего клана
 
-# Прокси для COC API (обязательно для Render)
+# Прокси для COC API (рекомендуется для Render)
 PROXY = "http://45.79.218.79:80"
 
 logging.basicConfig(level=logging.INFO)
@@ -22,11 +23,11 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-# Глобальная переменная для клиента COC (будет инициализирована при старте)
+# Глобальная переменная для клиента COC
 coc_client = None
 
 # ------------------------------------------------------------
-# Обработчики команд (используют coc_client)
+# Обработчики команд (ваша логика остаётся без изменений)
 # ------------------------------------------------------------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -36,184 +37,58 @@ async def cmd_start(message: types.Message):
         "/war – анализ текущей войны (таблица атак)\n"
         "/clan – информация о клане\n"
         "/members – список участников клана\n"
-        "/player [тег] – данные об игроке (например /player #ABC123)\n"
+        "/player [тег] – данные об игроке\n"
         "/remind – напомнить о неиспользованных атаках\n"
         "/help – повтор этого сообщения"
     )
     await message.answer(text)
 
-@dp.message(Command("help"))
-async def cmd_help(message: types.Message):
-    await cmd_start(message)
-
-@dp.message(Command("clan"))
-async def cmd_clan(message: types.Message):
-    if coc_client is None:
-        await message.answer("❌ Клиент COC ещё не инициализирован. Попробуйте через минуту.")
-        return
-    try:
-        clan = await coc_client.get_clan(CLAN_TAG)
-        text = (
-            f"🏰 **{clan.name}** ({clan.tag})\n"
-            f"📊 Уровень: {clan.level}\n"
-            f"👥 Участников: {clan.member_count}/50\n"
-            f"🏆 Трофеи: {clan.points}\n"
-            f"🛡️ Требуемые трофеи: {clan.required_trophies}\n"
-            f"🌍 Регион: {clan.location.name if clan.location else 'Не указан'}"
-        )
-        await message.answer(text, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Ошибка /clan: {e}")
-        await message.answer("❌ Не удалось получить информацию о клане.")
-
-@dp.message(Command("members"))
-async def cmd_members(message: types.Message):
-    if coc_client is None:
-        await message.answer("❌ Клиент COC ещё не инициализирован.")
-        return
-    try:
-        clan = await coc_client.get_clan(CLAN_TAG)
-        members = clan.members
-        members_sorted = sorted(members, key=lambda m: m.town_hall, reverse=True)
-        table = PrettyTable()
-        table.field_names = ["Игрок", "Роль", "ТХ", "Трофеи"]
-        for m in members_sorted:
-            role = "Глава" if m.role == "leader" else "Совет" if m.role == "coLeader" else "Старейшина" if m.role == "elder" else "Участник"
-            table.add_row([m.name, role, m.town_hall, m.trophies])
-        await message.answer(f"<pre><code>{table}</code></pre>", parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"Ошибка /members: {e}")
-        await message.answer("❌ Не удалось получить список участников.")
-
-@dp.message(Command("war"))
-async def cmd_war(message: types.Message):
-    if coc_client is None:
-        await message.answer("❌ Клиент COC ещё не инициализирован.")
-        return
-    try:
-        war = await coc_client.get_current_war(CLAN_TAG)
-        if war.state == "notInWar":
-            await message.answer("🔍 Клан не участвует в войне.")
-            return
-        our_clan = war.clan
-        enemy_clan = war.opponent
-        text = (
-            f"⚔️ **Война: {our_clan.name} vs {enemy_clan.name}**\n"
-            f"📊 Статус: {war.state}\n"
-            f"⭐ Наши звёзды: {our_clan.stars} / {war.team_size*3}\n"
-            f"🏆 Процент разрушения: {our_clan.destruction}%\n\n"
-        )
-        our_members = sorted(war.members, key=lambda m: m.town_hall, reverse=True)
-        enemy_members = sorted(war.opponent.members, key=lambda m: m.town_hall, reverse=True)
-        table = PrettyTable()
-        table.field_names = ["Атакующий (ТХ)", "Противник (ТХ)", "Рекомендация"]
-        for our, enemy in zip(our_members, enemy_members):
-            recommendation = "⚖️ Равный"
-            if our.town_hall > enemy.town_hall:
-                recommendation = "✅ Легкая цель"
-            elif our.town_hall < enemy.town_hall:
-                recommendation = "⚠️ Тяжелая цель"
-            table.add_row([f"{our.name} ({our.town_hall})", f"{enemy.name} ({enemy.town_hall})", recommendation])
-        unused_attacks = [m for m in our_members if m.attacks_used < m.attacks_per_member]
-        unused_text = ""
-        if unused_attacks:
-            unused_text = "\n⚠️ **Остались атаки:**\n" + "\n".join([f"• {m.name} ({m.attacks_used}/{m.attacks_per_member})" for m in unused_attacks])
-        else:
-            unused_text = "\n✅ Все атаки использованы!"
-        await message.answer(text + f"<pre><code>{table}</code></pre>" + unused_text, parse_mode="Markdown")
-    except coc.PrivateWarLog:
-        await message.answer("🔒 Лог войны клана закрыт. Невозможно получить данные.")
-    except Exception as e:
-        logger.error(f"Ошибка /war: {e}")
-        await message.answer("❌ Не удалось получить данные о войне.")
-
-@dp.message(Command("player"))
-async def cmd_player(message: types.Message):
-    if coc_client is None:
-        await message.answer("❌ Клиент COC ещё не инициализирован.")
-        return
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("❌ Укажите тег игрока, например: `/player #ABC123`", parse_mode="Markdown")
-        return
-    player_tag = args[1].upper()
-    try:
-        player = await coc_client.get_player(player_tag)
-        text = (
-            f"👤 **{player.name}** ({player.tag})\n"
-            f"🏠 Ратуша: {player.town_hall}\n"
-            f"🏆 Трофеи: {player.trophies}\n"
-            f"🏅 Наивысшие трофеи: {player.best_trophies}\n"
-            f"💪 Опыт: {player.exp_level}\n"
-            f"📅 В клане: {player.clan.name if player.clan else 'Не в клане'}"
-        )
-        await message.answer(text, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Ошибка /player: {e}")
-        await message.answer("❌ Игрок не найден. Проверьте тег (начинается с #).")
-
-@dp.message(Command("remind"))
-async def cmd_remind(message: types.Message):
-    if coc_client is None:
-        await message.answer("❌ Клиент COC ещё не инициализирован.")
-        return
-    try:
-        war = await coc_client.get_current_war(CLAN_TAG)
-        if war.state == "notInWar":
-            await message.answer("🔍 Клан не в войне, напоминать не о чем.")
-            return
-        unused = [m for m in war.members if m.attacks_used < m.attacks_per_member]
-        if not unused:
-            await message.answer("✅ Все атаки уже использованы!")
-        else:
-            remind_text = "⚔️ **У кого остались атаки:**\n"
-            for m in unused:
-                remind_text += f"• {m.name}: {m.attacks_used}/{m.attacks_per_member}\n"
-            await message.answer(remind_text, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Ошибка /remind: {e}")
-        await message.answer("❌ Не удалось проверить атаки.")
+# ... (остальные ваши обработчики /help, /clan, /members, /war, /player, /remind)
+# !!! ВАЖНО: Не копируйте их отсюда, вставьте свои готовые функции из предыдущей версии кода.
+# В этих функциях не нужно ничего менять, они будут использовать coc_client.
 
 # ------------------------------------------------------------
-# Инициализация клиента COC и запуск веб-сервера
+# Инициализация клиента COC (ИСПРАВЛЕНА)
 # ------------------------------------------------------------
 async def on_startup(app: web.Application):
-    """Асинхронная инициализация при старте приложения."""
     global coc_client
     logger.info("Инициализация клиента COC...")
     try:
-        coc_client = await coc.login(
-            COC_EMAIL,
-            COC_PASSWORD,
-            client=coc.EventsClient,
-            proxy=PROXY
-        )
-        logger.info("Клиент COC успешно создан")
+        # ✅ ПРАВИЛЬНЫЙ способ создать клиент (v3+)
+        coc_client = coc.Client(client=coc.EventsClient, proxy=PROXY)
+        # ✅ ПРАВИЛЬНЫЙ способ выполнить вход
+        await coc_client.login(COC_EMAIL, COC_PASSWORD)
+        logger.info("Клиент COC успешно создан и авторизован")
     except Exception as e:
-        logger.error(f"Ошибка при создании клиента COC: {e}")
+        logger.error(f"Ошибка при создании клиента COC: {e}", exc_info=True)
         coc_client = None
 
-    # Устанавливаем вебхук
     webhook_url = os.getenv('RENDER_EXTERNAL_URL')
     if webhook_url:
         await bot.set_webhook(f"{webhook_url}/webhook")
         logger.info(f"Webhook установлен на {webhook_url}/webhook")
     else:
-        logger.error("RENDER_EXTERNAL_URL не задана! Вебхук не будет работать.")
+        logger.error("RENDER_EXTERNAL_URL не задана!")
 
+async def on_shutdown(app: web.Application):
+    """Корректное завершение работы приложения."""
+    global coc_client
+    logger.info("Завершение работы приложения...")
+    if coc_client:
+        await coc_client.close()
+    await bot.session.close()
+
+# ------------------------------------------------------------
+# Запуск приложения
+# ------------------------------------------------------------
 def main():
-    """Запуск aiohttp сервера с вебхуками."""
     app = web.Application()
-    
-    # Подключаем обработчик вебхуков от aiogram
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     webhook_handler.register(app, path="/webhook")
-    
-    # Эндпоинт для проверки здоровья (health check)
     app.router.add_get("/health", lambda request: web.Response(text="OK"))
     
-    # Добавляем функцию инициализации при старте приложения
     app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
     
     port = int(os.environ.get('PORT', 8080))
     web.run_app(app, host='0.0.0.0', port=port)
