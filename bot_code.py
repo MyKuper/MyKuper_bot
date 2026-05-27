@@ -115,7 +115,11 @@ async def cmd_war(message: types.Message):
                 recommendation = "⚠️ Тяжелая цель"
             table.add_row([f"{our.name} ({our.town_hall})", f"{enemy.name} ({enemy.town_hall})", recommendation])
         unused_attacks = [m for m in our_members if m.attacks_used < m.attacks_per_member]
-        unused_text = "\n⚠️ **Остались атаки:**\n" + "\n".join([f"• {m.name} ({m.attacks_used}/{m.attacks_per_member})" for m in unused_attacks]) if unused_attacks else "\n✅ Все атаки использованы!"
+        unused_text = ""
+        if unused_attacks:
+            unused_text = "\n⚠️ **Остались атаки:**\n" + "\n".join([f"• {m.name} ({m.attacks_used}/{m.attacks_per_member})" for m in unused_attacks])
+        else:
+            unused_text = "\n✅ Все атаки использованы!"
         await message.answer(text + f"<pre><code>{table}</code></pre>" + unused_text, parse_mode="Markdown")
     except coc.PrivateWarLog:
         await message.answer("🔒 Лог войны клана закрыт. Невозможно получить данные.")
@@ -173,7 +177,7 @@ async def cmd_remind(message: types.Message):
 # ------------------------------------------------------------
 # Инициализация клиента COC и запуск веб-сервера
 # ------------------------------------------------------------
-async def on_startup():
+async def on_startup(app: web.Application):
     """Асинхронная инициализация при старте приложения."""
     global coc_client
     logger.info("Инициализация клиента COC...")
@@ -187,7 +191,6 @@ async def on_startup():
         logger.info("Клиент COC успешно создан")
     except Exception as e:
         logger.error(f"Ошибка при создании клиента COC: {e}")
-        # Продолжаем работу, но команды COC будут недоступны
         coc_client = None
 
     # Устанавливаем вебхук
