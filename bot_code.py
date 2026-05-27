@@ -2,8 +2,6 @@ import os
 import logging
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 import coc
 from prettytable import PrettyTable
@@ -12,9 +10,9 @@ from prettytable import PrettyTable
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 COC_EMAIL = os.getenv('COC_EMAIL')
 COC_PASSWORD = os.getenv('COC_PASSWORD')
-CLAN_TAG = "#2CY00G2VU"  # 👈 ЗДЕСЬ УКАЖИТЕ ТЕГ ВАШЕГО КЛАНА (например, "#2YQ9V9R8P")
+CLAN_TAG = "#2CY00G2VU" # 👈 НЕ ЗАБУДЬТЕ ЗАМЕНИТЬ НА ТЕГ ВАШЕГО КЛАНА!
 
-# Настройка прокси для COC API (обязательно для Render)
+# Прокси для COC API (обязательно для работы на Render)
 PROXY = "http://45.79.218.79:80"
 
 logging.basicConfig(level=logging.INFO)
@@ -32,7 +30,7 @@ coc_client = coc.login(
 )
 
 # ------------------------------------------------------------
-# 1. /start - приветствие
+# Обработчики команд (они остаются без изменений)
 # ------------------------------------------------------------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -52,9 +50,6 @@ async def cmd_start(message: types.Message):
 async def cmd_help(message: types.Message):
     await cmd_start(message)
 
-# ------------------------------------------------------------
-# 2. /clan – информация о клане
-# ------------------------------------------------------------
 @dp.message(Command("clan"))
 async def cmd_clan(message: types.Message):
     try:
@@ -70,44 +65,31 @@ async def cmd_clan(message: types.Message):
         await message.answer(text, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Ошибка /clan: {e}")
-        await message.answer("❌ Не удалось получить информацию о клане. Возможно, тег указан неверно или клан закрыт.")
+        await message.answer("❌ Не удалось получить информацию о клане.")
 
-# ------------------------------------------------------------
-# 3. /members – список участников с ратушами
-# ------------------------------------------------------------
 @dp.message(Command("members"))
 async def cmd_members(message: types.Message):
     try:
         clan = await coc_client.get_clan(CLAN_TAG)
         members = clan.members
-        
-        # Сортируем по уровню ратуши (от высшего к низшему)
         members_sorted = sorted(members, key=lambda m: m.town_hall, reverse=True)
-        
         table = PrettyTable()
         table.field_names = ["Игрок", "Роль", "ТХ", "Трофеи"]
         for m in members_sorted:
             role = "Глава" if m.role == "leader" else "Совет" if m.role == "coLeader" else "Старейшина" if m.role == "elder" else "Участник"
             table.add_row([m.name, role, m.town_hall, m.trophies])
-        
         await message.answer(f"<pre><code>{table}</code></pre>", parse_mode="HTML")
     except Exception as e:
         logger.error(f"Ошибка /members: {e}")
         await message.answer("❌ Не удалось получить список участников.")
 
-# ------------------------------------------------------------
-# 4. /war – анализ текущей войны
-# ------------------------------------------------------------
 @dp.message(Command("war"))
 async def cmd_war(message: types.Message):
     try:
         war = await coc_client.get_current_war(CLAN_TAG)
-        
         if war.state == "notInWar":
             await message.answer("🔍 Клан не участвует в войне.")
             return
-        
-        # Основная информация
         our_clan = war.clan
         enemy_clan = war.opponent
         text = (
@@ -116,12 +98,8 @@ async def cmd_war(message: types.Message):
             f"⭐ Наши звёзды: {our_clan.stars} / {war.team_size*3}\n"
             f"🏆 Процент разрушения: {our_clan.destruction}%\n\n"
         )
-        
-        # Сортируем участников по уровню ратуши (у обеих сторон)
         our_members = sorted(war.members, key=lambda m: m.town_hall, reverse=True)
         enemy_members = sorted(war.opponent.members, key=lambda m: m.town_hall, reverse=True)
-        
-        # Создаём таблицу соответствия "кто кого атакует"
         table = PrettyTable()
         table.field_names = ["Атакующий (ТХ)", "Противник (ТХ)", "Рекомендация"]
         for our, enemy in zip(our_members, enemy_members):
@@ -131,25 +109,15 @@ async def cmd_war(message: types.Message):
             elif our.town_hall < enemy.town_hall:
                 recommendation = "⚠️ Тяжелая цель"
             table.add_row([f"{our.name} ({our.town_hall})", f"{enemy.name} ({enemy.town_hall})", recommendation])
-        
-        # Неиспользованные атаки
         unused_attacks = [m for m in our_members if m.attacks_used < m.attacks_per_member]
-        unused_text = ""
-        if unused_attacks:
-            unused_text = "\n⚠️ **Остались атаки:**\n" + "\n".join([f"• {m.name} ({m.attacks_used}/{m.attacks_per_member})" for m in unused_attacks])
-        else:
-            unused_text = "\n✅ Все атаки использованы!"
-        
+        unused_text = "\n⚠️ **Остались атаки:**\n" + "\n".join([f"• {m.name} ({m.attacks_used}/{m.attacks_per_member})" for m in unused_attacks]) if unused_attacks else "\n✅ Все атаки использованы!"
         await message.answer(text + f"<pre><code>{table}</code></pre>" + unused_text, parse_mode="Markdown")
     except coc.PrivateWarLog:
         await message.answer("🔒 Лог войны клана закрыт. Невозможно получить данные.")
     except Exception as e:
         logger.error(f"Ошибка /war: {e}")
-        await message.answer("❌ Не удалось получить данные о войне. Возможно, войны нет или клан закрыт.")
+        await message.answer("❌ Не удалось получить данные о войне.")
 
-# ------------------------------------------------------------
-# 5. /player – информация об игроке
-# ------------------------------------------------------------
 @dp.message(Command("player"))
 async def cmd_player(message: types.Message):
     args = message.text.split()
@@ -172,9 +140,6 @@ async def cmd_player(message: types.Message):
         logger.error(f"Ошибка /player: {e}")
         await message.answer("❌ Игрок не найден. Проверьте тег (начинается с #).")
 
-# ------------------------------------------------------------
-# 6. /remind – напоминание о неиспользованных атаках в войне
-# ------------------------------------------------------------
 @dp.message(Command("remind"))
 async def cmd_remind(message: types.Message):
     try:
@@ -197,28 +162,24 @@ async def cmd_remind(message: types.Message):
 # ------------------------------------------------------------
 # Основная функция для запуска бота через вебхук
 # ------------------------------------------------------------
-async def on_startup() -> None:
-    """Действия при запуске бота."""
-    # Устанавливаем вебхук
+async def on_startup():
+    """Устанавливает вебхук при запуске приложения."""
     webhook_url = os.getenv('RENDER_EXTERNAL_URL')
-    if not webhook_url:
-        logger.error("Переменная окружения RENDER_EXTERNAL_URL не найдена!")
-        return
-    await bot.set_webhook(f"{webhook_url}/webhook")
+    if webhook_url:
+        await bot.set_webhook(f"{webhook_url}/webhook")
+        logger.info(f"Webhook set to {webhook_url}/webhook")
+    else:
+        logger.error("RENDER_EXTERNAL_URL not set!")
 
-def main() -> None:
-    """Запуск бота и веб-сервера."""
-    # Инициализируем веб-приложение
+def main():
+    """Запускает aiohttp сервер, который слушает вебхуки от Telegram."""
     app = web.Application()
     
-    # Настраиваем обработчик вебхуков
-    webhook_requests_handler = SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot,
-    )
-    webhook_requests_handler.register(app, path="/webhook")
+    # Подключаем обработчик вебхуков от aiogram
+    webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
+    webhook_handler.register(app, path="/webhook")
     
-    # Настраиваем эндпоинт для проверки здоровья Render
+    # Регистрируем обработчик проверки здоровья для Render
     app.router.add_get("/health", lambda request: web.Response(text="OK"))
     
     # Устанавливаем функцию, которая выполнится при старте приложения
