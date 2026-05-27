@@ -28,7 +28,7 @@ CLAN_TAG = "#2CY00G2VU"
 
 # Прокси (если нужен, иначе оставьте None или пустую строку)
 # Пример: "http://user:pass@ip:port"
-PROXY_URL = os.getenv('COC_PROXY', None) 
+PROXY_URL = None 
 
 # 🔒 БЕЗОПАСНОСТЬ: Список ID пользователей, которым разрешено управлять ботом
 # Узнайте свой ID через бота @userinfobot
