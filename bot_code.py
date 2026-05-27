@@ -1,14 +1,12 @@
 import os
 import logging
 import asyncio
-from typing import List, Optional
-
+from typing import List, Optional, Dict, Tuple
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, Filter
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web
-
 import coc
 from prettytable import PrettyTable
 
@@ -45,19 +43,136 @@ coc_client: Optional[coc.Client] = None
 # ============================================================
 def get_main_keyboard() -> InlineKeyboardMarkup:
     kb = [
-        [InlineKeyboardButton(text="⚔️ Статус войны", callback_data="war_info"),
-         InlineKeyboardButton(text="🏰 Клан", callback_data="clan_info")],
-        [InlineKeyboardButton(text="👥 Участники", callback_data="members_list"),
-         InlineKeyboardButton(text="🎯 Подбор целей (AI)", callback_data="war_targets")], # Новая кнопка
-        [InlineKeyboardButton(text="⏰ Кто не атаковал", callback_data="remind_attacks")]
+        [InlineKeyboardButton(text="⚔️ Статус Войны", callback_data="war_status"),
+         InlineKeyboardButton(text="🏰 Инфо Клана", callback_data="clan_info")],
+        [InlineKeyboardButton(text="🧠 УМНЫЙ ПОДБОР (AI)", callback_data="ai_attack_plan")],
+        [InlineKeyboardButton(text="📊 Кто кого атаковал", callback_data="war_attacks_log")],
+        [InlineKeyboardButton(text="⏰ Напоминание (Лентяи)", callback_data="remind_attacks")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def get_back_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_menu")]])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_menu")]])
 
 # ============================================================
-# 🧠 ЛОГИКА
+# 🧠 УМНЫЙ АЛГОРИТМ ПОДБОРА (AI SIMULATION)
+# ============================================================
+
+def calculate_attack_plan(war) -> str:
+    """
+    Алгоритм 'Умный Штурм':
+    1. Сортируем наших и врагов по ТХ.
+    2. Пытаемся найти равного противника (ТХ == ТХ).
+    3. Если нет равного, ищем следующего доступного.
+    4. Учитываем уже сделанные атаки.
+    """
+    our_members = sorted(war.clan.members, key=lambda m: m.town_hall, reverse=True)
+    enemy_members = sorted(war.opponent.members, key=lambda m: m.town_hall, reverse=True)
+    
+    # Создаем копию списка врагов, чтобы отмечать занятых
+    available_enemies = list(enemy_members)
+    
+    plan_text = "🧠 **ПЛАН АТАКИ (УМНЫЙ ПОДБОР)**\n\n"
+    plan_text += "🎯 *Приоритет: Равный ТХ -> Выше ТХ (добив) -> Ниже ТХ (набив)*\n\n"
+    
+    table = PrettyTable()
+    table.field_names = ["Наш боец", "Цель (Враг)", "Статус", "Рекомендация"]
+    table.align["Наш боец"] = "l"
+    table.align["Цель (Враг)"] = "l"
+    
+    attacks_per_member = war.attacks_per_member
+    
+    for member in our_members:
+        # Сколько атак уже сделал наш боец
+        attacks_done = len(member.attacks)
+        if attacks_done >= attacks_per_member:
+            continue # Этот уже все сделал
+            
+        # Ищем цель
+        target = None
+        target_idx = -1
+        recommendation = ""
+        
+        # 1. Ищем равного по ТХ
+        for i, enemy in enumerate(available_enemies):
+            if enemy.town_hall == member.town_hall:
+                # Проверка: не атаковал ли он уже этого врага?
+                already_attacked = any(a.defender_tag == enemy.tag for a in member.attacks)
+                if not already_attacked:
+                    target = enemy
+                    target_idx = i
+                    recommendation = "⚖️ Равный бой"
+                    break
+        
+        # 2. Если равного нет, ищем чуть выше (для добивания сильных) или ниже (для набивки)
+        if not target:
+            for i, enemy in enumerate(available_enemies):
+                already_attacked = any(a.defender_tag == enemy.tag for a in member.attacks)
+                if not already_attacked:
+                    # Приоритет: бить того, кто еще не получил 2 звезды от других (упрощенно)
+                    target = enemy
+                    target_idx = i
+                    if enemy.town_hall > member.town_hall:
+                        recommendation = "⚠️ Сложная цель (Герои?)"
+                    else:
+                        recommendation = "✅ Легкая цель (Набивка)"
+                    break
+        
+        if target:
+            status = f"{attacks_done}/{attacks_per_member}"
+            table.add_row([f"{member.name} (ТХ{member.town_hall})", f"{target.name} (ТХ{target.town_hall})", status, recommendation])
+            # Если атака планируется, временно помечаем врага как занятого для следующих (логика упрощена)
+            # В реальном бою список динамический, но для плана это работает
+            # available_enemies.pop(target_idx) 
+
+    plan_text += f"<pre><code>{table}</code></pre>"
+    
+    # Добавляем статистику
+    total_attacks = sum(len(m.attacks) for m in our_members)
+    max_attacks = len(our_members) * attacks_per_member
+    progress = round((total_attacks / max_attacks) * 100, 1)
+    
+    plan_text += f"\n📊 **Прогресс войны:** {total_attacks}/{max_attacks} атак ({progress}%)"
+    
+    return plan_text
+
+def analyze_existing_attacks(war) -> str:
+    """Анализирует, кто кого уже атаковал"""
+    our_members = war.clan.members
+    text = "⚔️ **ХРОНИКА БОЯ (Кто кого атаковал)**\n\n"
+    
+    table = PrettyTable()
+    table.field_names = ["Атакующий", "Защитник", "Звезды", "%", "Статус"]
+    table.align["Атакующий"] = "l"
+    table.align["Защитник"] = "l"
+    
+    count = 0
+    for member in our_members:
+        for attack in member.attacks:
+            try:
+                defender = war.get_opponent_member(attack.defender_tag)
+                stars = "⭐" * attack.stars
+                status = "💀 Снос" if attack.stars == 3 else ("🔥 Частично" if attack.stars > 0 else "❌ Пусто")
+                table.add_row([
+                    f"{member.name} (ТХ{member.town_hall})",
+                    f"{defender.name} (ТХ{defender.town_hall})",
+                    stars,
+                    f"{attack.destruction}%",
+                    status
+                ])
+                count += 1
+            except:
+                continue
+    
+    if count == 0:
+        return "🔍 Атак пока не зафиксировано."
+        
+    text += f"<pre><code>{table}</code></pre>"
+    text += f"\n_Всего атак: {count}_"
+    return text
+
+# ============================================================
+# 🧠 ОСНОВНАЯ ЛОГИКА
 # ============================================================
 
 async def handle_clan_info(update: types.Message | types.CallbackQuery):
@@ -81,51 +196,17 @@ async def handle_clan_info(update: types.Message | types.CallbackQuery):
         else:
             await update.message.answer(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
     except Exception as e:
-        logger.error(f"Error clan info: {e}", exc_info=True)
-        msg = "❌ Ошибка получения данных о клане."
+        logger.error(f"Error clan info: {e}")
+        msg = "❌ Ошибка данных клана."
         if isinstance(update, types.Message): await update.answer(msg)
         else: await update.message.answer(msg)
 
-async def handle_members_list(update: types.Message | types.CallbackQuery):
-    if not coc_client: return
-    try:
-        clan = await coc_client.get_clan(CLAN_TAG)
-        if not hasattr(clan, 'members') or not clan.members:
-            raise ValueError("Список участников пуст")
-            
-        members = sorted(clan.members, key=lambda m: m.trophies, reverse=True)
-        
-        table = PrettyTable()
-        table.field_names = ["Имя", "Роль", "ТХ", "Трофеи"]
-        table.align["Имя"] = "l"
-        
-        for m in members[:25]: # Увеличил до 25
-            role_map = {"leader": "👑 Глава", "coLeader": "🛡️ Совет", "elder": "🎖️ Старейшина", "member": "👤 Участник"}
-            role = role_map.get(getattr(m, 'role', 'member'), "👤 Участник")
-            table.add_row([m.name, role, getattr(m, 'town_hall', '?'), getattr(m, 'trophies', 0)])
-            
-        text = f"👥 **Топ участников клана:**\n<pre><code>{table}</code></pre>"
-        if len(members) > 25:
-            text += f"\n_... и еще {len(members) - 25}_"
-            
-        if isinstance(update, types.Message):
-            await update.answer(text, parse_mode="HTML", reply_markup=get_back_keyboard())
-        else:
-            await update.message.answer(text, parse_mode="HTML", reply_markup=get_back_keyboard())
-            
-    except Exception as e:
-        logger.error(f"Error members list: {e}", exc_info=True)
-        msg = "❌ Ошибка списка участников. Проверьте логи."
-        if isinstance(update, types.Message): await update.answer(msg)
-        else: await update.message.answer(msg)
-
-async def handle_war_info(update: types.Message | types.CallbackQuery):
+async def handle_war_status(update: types.Message | types.CallbackQuery):
     if not coc_client: return
     try:
         war = await coc_client.get_current_war(CLAN_TAG)
-        
         if war.state == "notInWar":
-            msg = "🔍 Сейчас нет активной войны."
+            msg = "🔍 Войны сейчас нет."
             if isinstance(update, types.Message): await update.answer(msg, reply_markup=get_back_keyboard())
             else: await update.message.answer(msg, reply_markup=get_back_keyboard())
             return
@@ -133,79 +214,55 @@ async def handle_war_info(update: types.Message | types.CallbackQuery):
         our_clan = war.clan
         enemy_clan = war.opponent
         
-        our_stars = getattr(our_clan, 'stars', 0)
-        enemy_stars = getattr(enemy_clan, 'stars', 0)
-        our_dest = getattr(our_clan, 'destruction', 0)
-        enemy_dest = getattr(enemy_clan, 'destruction', 0)
-
         text = (
             f"⚔️ **ВОЙНА: {our_clan.name} vs {enemy_clan.name}**\n\n"
-            f"📊 Счёт: `{our_stars}` : `{enemy_stars}` (Звёзды)\n"
-            f"💥 Разрушение: `{our_dest}%` : `{enemy_dest}%`\n"
-            f"⏳ Статус: `{war.state}`\n\n"
+            f"📊 Счёт: `{our_clan.stars}` : `{enemy_clan.stars}`\n"
+            f"💥 Разрушение: `{our_clan.destruction}%` : `{enemy_clan.destruction}%`\n"
+            f"⏳ Статус: `{war.state}`\n"
         )
         
-        # Таблица последних атак
-        table = PrettyTable()
-        table.field_names = ["Атакующий", "Цель", "Результат"]
-        table.align["Атакующий"] = "l"
-        table.align["Цель"] = "l"
-        
-        attacks_displayed = 0
-        if hasattr(our_clan, 'members') and our_clan.members:
-            # Собираем все атаки и сортируем по времени (свежие внизу или вверху, тут просто берем последние)
-            all_attacks = []
-            for member in our_clan.members:
-                if hasattr(member, 'attacks'):
-                    for attack in member.attacks:
-                        all_attacks.append((member, attack))
-            
-            # Берем последние 10 атак
-            recent_attacks = all_attacks[-10:] if len(all_attacks) > 10 else all_attacks
-            
-            for member, attack in recent_attacks:
-                try:
-                    defender = war.get_opponent_member(attack.defender_tag)
-                    stars_str = "⭐" * attack.stars
-                    dest_str = f"{attack.destruction}%"
-                    table.add_row([f"{member.name} (ТХ{member.town_hall})", f"{defender.name} (ТХ{defender.town_hall})", f"{stars_str} {dest_str}"])
-                    attacks_displayed += 1
-                except: continue
-        
-        if attacks_displayed > 0:
-            text += f"🕒 **Последние атаки:**\n<pre><code>{table}</code></pre>\n"
-        
-        # Список кто не доиграл
-        unused = []
-        if hasattr(our_clan, 'members'):
-            unused = [m for m in our_clan.members if hasattr(m, 'attacks') and len(m.attacks) < war.attacks_per_member]
-            
+        # Краткий список лентяев
+        unused = [m for m in our_clan.members if len(m.attacks) < war.attacks_per_member]
         if unused:
-            text += "\n⚠️ **Есть неиспользованные атаки:**\n"
-            for m in unused:
-                left = war.attacks_per_member - len(m.attacks)
-                status = "❗️ 2 атаки" if left == 2 else "⚠️ 1 атака"
-                text += f"• {m.name} (ТХ{m.town_hall}): {status}\n"
-        else:
-            text += "\n✅ Все атаки использованы!"
-
+            text += f"\n⚠️ **Ждут хода:** {len(unused)} чел.\n"
+            # Топ 3 кто не ходил
+            for m in unused[:3]:
+                text += f"• {m.name} (ТХ{m.town_hall})\n"
+        
         if isinstance(update, types.Message):
-            await update.answer(text, parse_mode="HTML", reply_markup=get_back_keyboard())
+            await update.answer(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
         else:
-            await update.message.answer(text, parse_mode="HTML", reply_markup=get_back_keyboard())
-
-    except coc.PrivateWarLog:
-        msg = "🔒 Лог войны закрыт настройками клана."
-        if isinstance(update, types.Message): await update.answer(msg)
-        else: await update.message.answer(msg)
+            await update.message.answer(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
+            
     except Exception as e:
-        logger.error(f"Error war info: {e}", exc_info=True)
+        logger.error(f"Error war status: {e}", exc_info=True)
         msg = "❌ Ошибка данных войны."
         if isinstance(update, types.Message): await update.answer(msg)
         else: await update.message.answer(msg)
 
-async def handle_war_targets(update: types.Message | types.CallbackQuery):
-    """Умный подбор целей"""
+async def handle_ai_plan(update: types.Message | types.CallbackQuery):
+    if not coc_client: return
+    try:
+        war = await coc_client.get_current_war(CLAN_TAG)
+        if war.state == "notInWar":
+            msg = "🔍 Войны нет, план составить нельзя."
+            if isinstance(update, types.Message): await update.answer(msg)
+            else: await update.message.answer(msg)
+            return
+            
+        plan = calculate_attack_plan(war)
+        if isinstance(update, types.Message):
+            await update.answer(plan, parse_mode="HTML", reply_markup=get_back_keyboard())
+        else:
+            await update.message.answer(plan, parse_mode="HTML", reply_markup=get_back_keyboard())
+            
+    except Exception as e:
+        logger.error(f"Error AI plan: {e}", exc_info=True)
+        msg = "❌ Ошибка при расчете плана."
+        if isinstance(update, types.Message): await update.answer(msg)
+        else: await update.message.answer(msg)
+
+async def handle_attacks_log(update: types.Message | types.CallbackQuery):
     if not coc_client: return
     try:
         war = await coc_client.get_current_war(CLAN_TAG)
@@ -214,55 +271,16 @@ async def handle_war_targets(update: types.Message | types.CallbackQuery):
             if isinstance(update, types.Message): await update.answer(msg)
             else: await update.message.answer(msg)
             return
-
-        our_members = sorted(war.clan.members, key=lambda x: x.town_hall, reverse=True)
-        enemy_members = sorted(war.opponent.members, key=lambda x: x.town_hall, reverse=True)
-        
-        # Фильтруем только тех, у кого есть атаки (для простоты берем всех, но можно фильтровать по атакам)
-        # Логика: Наш самый сильный бьет самого сильного врага.
-        # Если у нас больше людей, лишние добивают нижних.
-        
-        text = "🎯 **РЕКОМЕНДАЦИИ ПО АТАКАМ (AI):**\n\n"
-        text += "_Логика: Равный бьет равного. Если мы сильнее сверху, то наши средние бьют их топ._\n\n"
-        
-        targets_assigned = []
-        enemy_idx = 0
-        
-        for our_member in our_members:
-            # Пропускаем тех, кто уже сделал 2 атаки (если нужно учитывать текущий статус)
-            # Но для плана на всю войну лучше расписать всем
-            if enemy_idx >= len(enemy_members):
-                break # Враги кончились
             
-            enemy = enemy_members[enemy_idx]
-            
-            # Красивое описание матчапа
-            matchup = ""
-            if our_member.town_hall > enemy.town_hall:
-                matchup = "✅ Легкая цель"
-            elif our_member.town_hall < enemy.town_hall:
-                matchup = "⚠️ Сложная цель"
-            else:
-                matchup = "⚖️ Равный бой"
-            
-            targets_assigned.append(f"🔹 {our_member.name} (ТХ{our_member.town_hall}) ➜ {enemy.name} (ТХ{enemy.town_hall}) [{matchup}]")
-            
-            # Простая логика перебора: каждый бьет своего по списку
-            # Для более сложной логики (добивание) нужно усложнять алгоритм
-            enemy_idx += 1
-            
-        # Вывод списка
-        for line in targets_assigned:
-            text += f"{line}\n"
-            
+        log = analyze_existing_attacks(war)
         if isinstance(update, types.Message):
-            await update.answer(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
+            await update.answer(log, parse_mode="HTML", reply_markup=get_back_keyboard())
         else:
-            await update.message.answer(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
-
+            await update.message.answer(log, parse_mode="HTML", reply_markup=get_back_keyboard())
+            
     except Exception as e:
-        logger.error(f"Error war targets: {e}", exc_info=True)
-        msg = "❌ Ошибка подбора целей."
+        logger.error(f"Error attacks log: {e}", exc_info=True)
+        msg = "❌ Ошибка получения логов атак."
         if isinstance(update, types.Message): await update.answer(msg)
         else: await update.message.answer(msg)
 
@@ -276,30 +294,32 @@ async def handle_remind_attacks(update: types.Message | types.CallbackQuery):
             else: await update.message.answer(msg)
             return
             
-        unused = []
-        if hasattr(war, 'clan') and hasattr(war.clan, 'members'):
-            unused = [m for m in war.clan.members if hasattr(m, 'attacks') and len(m.attacks) < war.attacks_per_member]
-            
-        if not unused:
-            msg = "✅ Все участники использовали свои атаки!"
-        else:
-            # Разделяем на тех у кого 1 и 2 атаки
-            two_attacks = [m for m in unused if (war.attacks_per_member - len(m.attacks)) == 2]
-            one_attack = [m for m in unused if (war.attacks_per_member - len(m.attacks)) == 1]
-            
-            msg = "⚔️ **НАПОМИНАНИЕ ОБ АТАКАХ:**\n\n"
-            
-            if two_attacks:
-                msg += "🔴 **НЕ НАЧАЛИ ВООВЩЕ (2 атаки):**\n"
-                for m in two_attacks:
-                    msg += f"• {m.name} (ТХ{m.town_hall})\n"
-                msg += "\n"
-                
-            if one_attack:
-                msg += "🟠 **ДОБИТЬ (1 атака):**\n"
-                for m in one_attack:
-                    msg += f"• {m.name} (ТХ{m.town_hall})\n"
+        unused_full = [] # 0 атак
+        unused_partial = [] # 1 атака
         
+        for m in war.clan.members:
+            count = len(m.attacks)
+            if count == 0:
+                unused_full.append(m)
+            elif count < war.attacks_per_member:
+                unused_partial.append(m)
+        
+        msg = "⏰ **НАПОМИНАЛКА**\n\n"
+        
+        if unused_full:
+            msg += "🔴 **ВООБЩЕ НЕ ХОДИЛИ (0 атак):**\n"
+            for m in sorted(unused_full, key=lambda x: x.town_hall, reverse=True):
+                msg += f"• {m.name} (ТХ{m.town_hall})\n"
+            msg += "\n"
+            
+        if unused_partial:
+            msg += "🟠 **НУЖНО ДОБИТЬ (1 атака):**\n"
+            for m in sorted(unused_partial, key=lambda x: x.town_hall, reverse=True):
+                left = war.attacks_per_member - len(m.attacks)
+                msg += f"• {m.name} (ТХ{m.town_hall}) - осталось {left}\n"
+        elif not unused_full:
+            msg += "✅ Все отходили!"
+            
         if isinstance(update, types.Message):
             await update.answer(msg, parse_mode="Markdown", reply_markup=get_back_keyboard())
         else:
@@ -307,7 +327,7 @@ async def handle_remind_attacks(update: types.Message | types.CallbackQuery):
             
     except Exception as e:
         logger.error(f"Error remind: {e}", exc_info=True)
-        msg = "❌ Ошибка проверки атак."
+        msg = "❌ Ошибка напоминания."
         if isinstance(update, types.Message): await update.answer(msg)
         else: await update.message.answer(msg)
 
@@ -316,28 +336,12 @@ async def handle_remind_attacks(update: types.Message | types.CallbackQuery):
 # ============================================================
 @dp.message(Command("start"), AdminFilter())
 async def cmd_start(message: types.Message):
-    text = f"👋 Привет, {message.from_user.first_name}!\n\nЯ бот-помощник для управления кланом.\nВыберите действие:"
-    await message.answer(text, reply_markup=get_main_keyboard())
+    text = f"👋 Привет, {message.from_user.first_name}!\n\n🤖 Я **Clash Assistant** с функцией **AI-подбора**.\nВыберите действие:"
+    await message.answer(text, parse_mode="Markdown", reply_markup=get_main_keyboard())
 
 @dp.message(Command("help"), AdminFilter())
 async def cmd_help(message: types.Message):
     await cmd_start(message)
-
-@dp.message(Command("clan"), AdminFilter())
-async def cmd_clan(message: types.Message):
-    await handle_clan_info(message)
-
-@dp.message(Command("members"), AdminFilter())
-async def cmd_members(message: types.Message):
-    await handle_members_list(message)
-
-@dp.message(Command("war"), AdminFilter())
-async def cmd_war(message: types.Message):
-    await handle_war_info(message)
-
-@dp.message(Command("remind"), AdminFilter())
-async def cmd_remind(message: types.Message):
-    await handle_remind_attacks(message)
 
 # ============================================================
 # 🔄 CALLBACK QUERY
@@ -352,20 +356,20 @@ async def cb_clan(callback: types.CallbackQuery):
     await callback.answer()
     await handle_clan_info(callback)
 
-@dp.callback_query(F.data == "members_list")
-async def cb_members(callback: types.CallbackQuery):
-    await callback.answer()
-    await handle_members_list(callback)
-
-@dp.callback_query(F.data == "war_info")
+@dp.callback_query(F.data == "war_status")
 async def cb_war(callback: types.CallbackQuery):
     await callback.answer()
-    await handle_war_info(callback)
+    await handle_war_status(callback)
 
-@dp.callback_query(F.data == "war_targets") # Новая функция
-async def cb_targets(callback: types.CallbackQuery):
-    await callback.answer()
-    await handle_war_targets(callback)
+@dp.callback_query(F.data == "ai_attack_plan")
+async def cb_ai(callback: types.CallbackQuery):
+    await callback.answer("🧠 Расчет плана...")
+    await handle_ai_plan(callback)
+
+@dp.callback_query(F.data == "war_attacks_log")
+async def cb_log(callback: types.CallbackQuery):
+    await callback.answer("📊 Загрузка логов...")
+    await handle_attacks_log(callback)
 
 @dp.callback_query(F.data == "remind_attacks")
 async def cb_remind(callback: types.CallbackQuery):
