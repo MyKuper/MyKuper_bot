@@ -1,11 +1,16 @@
 import os
 import logging
 import asyncio
-from typing import Optional, List
+import sqlite3
+import datetime
+from typing import Optional
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, Filter
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
 import coc
 from prettytable import PrettyTable
@@ -18,7 +23,8 @@ COC_EMAIL = os.getenv('COC_EMAIL')
 COC_PASSWORD = os.getenv('COC_PASSWORD')
 CLAN_TAG = "#2CY00G2VU"
 PROXY_URL = os.getenv('COC_PROXY', None)
-ADMIN_IDS = []  # Ваш ID: 1810701319
+ADMIN_IDS = [1810701319]  # Ваш ID (оставлен для возможных будущих админ-команд)
+DB_FILE = "bot_data.db"
 
 # ============================================================
 # 🛠 ЛОГИРОВАНИЕ
@@ -32,11 +38,51 @@ class AdminFilter(Filter):
         return message.from_user.id in ADMIN_IDS
 
 # ============================================================
+# 🗄 БАЗА ДАННЫХ (SQLite для аккаунтов)
+# ============================================================
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (tg_id INTEGER PRIMARY KEY, tg_username TEXT, is_admin INTEGER DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS linked_accounts
+                 (tg_id INTEGER, player_tag TEXT, player_name TEXT,
+                 PRIMARY KEY (tg_id, player_tag))''')
+    conn.commit()
+    conn.close()
+
+def link_account_db(tg_id, tg_username, player_tag, player_name):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (tg_id, tg_username) VALUES (?, ?)", (tg_id, tg_username))
+    c.execute("UPDATE users SET tg_username = ? WHERE tg_id = ?", (tg_username, tg_id))
+    c.execute("INSERT OR REPLACE INTO linked_accounts (tg_id, player_tag, player_name) VALUES (?, ?, ?)",
+              (tg_id, player_tag, player_name))
+    conn.commit()
+    conn.close()
+
+def get_linked_accounts_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT player_tag, tg_username FROM linked_accounts JOIN users ON linked_accounts.tg_id = users.tg_id")
+    # Возвращаем словарь: { "#TAG": "@username" }
+    mapping = {row[0]: f"@{row[1]}" for row in c.fetchall() if row[1]}
+    conn.close()
+    return mapping
+
+# ============================================================
 # 🤖 ИНИЦИАЛИЗАЦИЯ
 # ============================================================
 bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage()) # MemoryStorage нужен для FSM (сценариев)
 coc_client: Optional[coc.Client] = None
+
+# ============================================================
+# 🔄 FSM СОСТОЯНИЯ (Для привязки аккаунта)
+# ============================================================
+class LinkAccount(StatesGroup):
+    waiting_for_tag = State()
+    waiting_for_confirmation = State()
 
 # ============================================================
 # ⌨️ КЛАВИАТУРЫ
@@ -47,6 +93,7 @@ def get_main_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="🏰 Инфо о клане", callback_data="clan_info")],
         [InlineKeyboardButton(text="⏰ Кто не ходил", callback_data="remind_full"),
          InlineKeyboardButton(text="📊 История атак", callback_data="attack_logs")],
+        [InlineKeyboardButton(text="🔗 Привязать аккаунт", callback_data="link_account")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
@@ -92,6 +139,9 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery):
         our_clan = war.clan
         enemy_clan = war.opponent
         
+        # Подтягиваем привязанные Telegram-юзернеймы
+        tg_mapping = get_linked_accounts_db()
+
         # --- Заголовок войны (HTML) ---
         header = (
             f"⚔️ <b>ВОЙНА: {our_clan.name} vs {enemy_clan.name}</b>\n\n"
@@ -100,14 +150,19 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery):
             f"⏳ Статус: <code>{war.state}</code>\n"
         )
 
-        # Сбор информации об участниках
         our_members_info = []
         if our_clan and our_clan.members:
             for m in our_clan.members:
                 attacks = getattr(m, 'attacks', []) or []
+                
+                # Добавляем Telegram юзернейм, если он привязан
+                display_name = m.name
+                if m.tag in tg_mapping:
+                    display_name += f" ({tg_mapping[m.tag]})"
+
                 our_members_info.append({
                     'obj': m,
-                    'name': m.name,
+                    'name': display_name,
                     'th': getattr(m, 'town_hall', 0) or 0,
                     'map_pos': getattr(m, 'map_position', '?'),
                     'attacks_count': len(attacks),
@@ -125,10 +180,8 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery):
                     'destruction': getattr(m, 'destruction', 0) or 0,
                 })
 
-        # 1. Отправляем Заголовок
         await send_msg(update, header, parse_mode="HTML")
 
-        # --- Полный список состава и позиций ---
         our_sorted_by_pos = sorted(our_members_info, key=lambda x: (x['map_pos'] if isinstance(x['map_pos'], int) else 99))
         
         roster_chunks = []
@@ -140,7 +193,6 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery):
             att_str = f"{m['attacks_count']}/{war.attacks_per_member}"
             line = f"• <code>{pos_str}</code> | {m['name']} (ТХ{m['th']}) - Атаки: {att_str}\n"
             
-            # Проверка на лимит Telegram (4096), оставляем запас
             if len(current_chunk) + len(line) > 3800:
                 roster_chunks.append(current_chunk)
                 current_chunk = "👥 <b>СОСТАВ (продолжение):</b>\n" + line
@@ -152,9 +204,7 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery):
         
         roster_chunks.append(current_chunk)
         
-        # Отправляем состав частями
         for i, chunk in enumerate(roster_chunks):
-            # Если это последний кусок, добавляем список "Требуют внимания" в конце
             if i == len(roster_chunks) - 1:
                 if lazy_list:
                     chunk += f"\n⚠️ <b>Требуют внимания ({len(lazy_list)} чел.):</b>\n" + "\n".join(lazy_list)
@@ -162,7 +212,6 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery):
                     chunk += "\n✅ Все участники использовали все атаки!"
             await send_msg(update, chunk, parse_mode="HTML")
 
-        # --- УМНЫЙ ПЛАН АТАКИ (AI) ---
         our_sorted_by_th = sorted(our_members_info, key=lambda x: x['th'], reverse=True)
         enemy_sorted = sorted(enemy_members_info, key=lambda x: (x['map_pos'] if isinstance(x['map_pos'], int) else 99))
         
@@ -170,7 +219,6 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery):
         
         plan_header = "🧠 <b>ТАКТИЧЕСКИЙ ПЛАН (AI)</b>\n\n"
         
-        # Добивающие
         dobivators_names = []
         for tag in dobiv_role_tags:
             for m in our_members_info:
@@ -182,7 +230,6 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery):
         
         await send_msg(update, plan_header, parse_mode="HTML")
 
-        # Основной удар
         first_strike_plan = []
         used_enemy_targets = set()
         
@@ -231,7 +278,6 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery):
         msg_1 = f"<b>1️⃣ ОСНОВНОЙ УДАР:</b>\n<pre><code>{table_1}</code></pre>"
         await send_msg(update, msg_1, parse_mode="HTML")
         
-        # Второй удар
         second_strike_plan = []
         for attacker in our_sorted_by_pos:
             if attacker['attacks_count'] >= 2: continue
@@ -283,6 +329,42 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery):
             msg_2 = "<i>Нет доступных вторых атак или целей.</i>"
             
         await send_msg(update, msg_2, parse_mode="HTML", reply_markup=get_back_keyboard())
+
+        # ============================================================
+        # 💾 СОХРАНЕНИЕ ОТЧЕТА В MARKDOWN (Для Git/GitHub)
+        # ============================================================
+        try:
+            os.makedirs('reports', exist_ok=True)
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+            filename = f"reports/war_report_{timestamp}.md"
+            
+            with open(filename, 'w', encoding='utf-8') as f:
+                # Заголовок
+                clean_header = header.replace('<b>', '**').replace('</b>', '**').replace('<code>', '`').replace('</code>', '`').replace('<i>', '*').replace('</i>', '*')
+                f.write(clean_header + "\n\n")
+                
+                # Состав
+                for chunk in roster_chunks:
+                    clean_chunk = chunk.replace('<b>', '**').replace('</b>', '**').replace('<code>', '`').replace('</code>', '`')
+                    f.write(clean_chunk + "\n")
+                    
+                # План
+                clean_plan = plan_header.replace('<b>', '**').replace('</b>', '**').replace('<i>', '*').replace('</i>', '*')
+                f.write("\n" + clean_plan + "\n")
+                
+                # Таблицы
+                f.write(f"**1️⃣ ОСНОВНОЙ УДАР:**\n```text\n{table_1}\n```\n\n")
+                if second_strike_plan:
+                    f.write(f"**2️⃣ ДОБИВАНИЕ И НАБИВКА:**\n```text\n{table_2}\n```\n")
+                    
+            # Отправка файла в чат
+            if isinstance(update, types.Message):
+                await update.answer_document(FSInputFile(filename), caption="📁 Отчет сохранен в Markdown (готов для коммита в Git/GitHub).")
+            else:
+                await update.message.answer_document(FSInputFile(filename), caption="📁 Отчет сохранен в Markdown (готов для коммита в Git/GitHub).")
+                
+        except Exception as e:
+            logger.error(f"Error saving report: {e}")
 
     except coc.PrivateWarLog:
         await send_msg(update, "🔒 Лог войны закрыт настройками клана.")
@@ -367,7 +449,6 @@ async def handle_attack_logs(update: types.Message | types.CallbackQuery):
         logger.error(f"Error logs: {e}")
         await send_msg(update, "❌ Ошибка загрузки истории.")
 
-# Вспомогательная функция
 async def send_msg(update: types.Message | types.CallbackQuery, text: str, parse_mode=None, reply_markup=None):
     try:
         if isinstance(update, types.Message):
@@ -378,31 +459,130 @@ async def send_msg(update: types.Message | types.CallbackQuery, text: str, parse
         logger.error(f"Error sending message: {e} | Text length: {len(text)}")
 
 # ============================================================
-# 🤖 ОБРАБОТЧИКИ КОМАНД
+# 🤖 ОБРАБОТЧИКИ КОМАНД (Публичные)
 # ============================================================
-@dp.message(Command("start"), AdminFilter())
+@dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     text = f"👋 Привет, {message.from_user.first_name}!\n\n🤖 Я Clash Assistant с функцией AI-подбора.\nВыберите действие:"
     await message.answer(text, reply_markup=get_main_keyboard())
 
-@dp.message(Command("help"), AdminFilter())
+@dp.message(Command("help"))
 async def cmd_help(message: types.Message):
     await cmd_start(message)
 
-@dp.message(Command("clan"), AdminFilter())
+@dp.message(Command("clan"))
 async def cmd_clan(message: types.Message):
     await handle_clan_info(message)
 
-@dp.message(Command("war"), AdminFilter())
+@dp.message(Command("war"))
 async def cmd_war(message: types.Message):
     await handle_war_plan(message)
 
-@dp.message(Command("remind"), AdminFilter())
+@dp.message(Command("remind"))
 async def cmd_remind(message: types.Message):
     await handle_remind_full(message)
 
+@dp.message(Command("myaccounts"))
+async def cmd_myaccounts(message: types.Message):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT player_name, player_tag FROM linked_accounts WHERE tg_id = ?", (message.from_user.id,))
+    accounts = c.fetchall()
+    conn.close()
+    
+    if not accounts:
+        await message.answer("🔗 У вас нет привязанных аккаунтов.\nИспользуйте /link для привязки.")
+        return
+        
+    text = "👤 <b>Ваши привязанные аккаунты:</b>\n\n"
+    for name, tag in accounts:
+        text += f"• {name} (<code>{tag}</code>)\n"
+        
+    await message.answer(text, parse_mode="HTML")
+
 # ============================================================
-# 🔄 CALLBACK QUERY
+# 🔗 ПРИВЯЗКА АККАУНТА (FSM Сценарий)
+# ============================================================
+@dp.message(Command("link"))
+@dp.callback_query(F.data == "link_account")
+async def cmd_link(update: types.Message | types.CallbackQuery, state: FSMContext):
+    if isinstance(update, types.CallbackQuery):
+        await update.answer()
+        msg = update.message
+    else:
+        msg = update
+        
+    await msg.answer(
+        "🔗 <b>Привязка аккаунта</b>\n\n"
+        "Отправьте ваш тег игрока в Clash of Clans (например, <code>#2Y8QV9JQ</code>).\n"
+        "Чтобы отменить, отправьте /cancel.",
+        parse_mode="HTML"
+    )
+    await state.set_state(LinkAccount.waiting_for_tag)
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        return
+    await state.clear()
+    await message.answer("❌ Действие отменено.")
+
+@dp.message(LinkAccount.waiting_for_tag)
+async def process_tag(message: types.Message, state: FSMContext):
+    tag = message.text.strip().upper()
+    if not tag.startswith('#'):
+        tag = '#' + tag
+    
+    if not coc_client:
+        await message.answer("❌ Клиент COC не подключен.")
+        await state.clear()
+        return
+
+    try:
+        player = await coc_client.get_player(tag)
+        await state.update_data(player_tag=tag, player_name=player.name)
+        
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, это я", callback_data="confirm_link_yes")],
+            [InlineKeyboardButton(text="❌ Нет, отмена", callback_data="confirm_link_no")]
+        ])
+        await message.answer(
+            f"🔍 Найден игрок: <b>{player.name}</b> (ТХ{player.town_hall})\n"
+            f"Тег: <code>{tag}</code>\n\n"
+            f"Это ваш аккаунт? Подтвердите привязку:",
+            parse_mode="HTML", reply_markup=kb
+        )
+        await state.set_state(LinkAccount.waiting_for_confirmation)
+    except coc.NotFound:
+        await message.answer("❌ Игрок с таким тегом не найден. Попробуйте еще раз или /cancel.")
+    except Exception as e:
+        logger.error(f"Error verifying tag: {e}")
+        await message.answer(f"❌ Ошибка проверки тега. Попробуйте позже.")
+        await state.clear()
+
+@dp.callback_query(F.data == "confirm_link_yes", LinkAccount.waiting_for_confirmation)
+async def confirm_yes(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    tg_id = callback.from_user.id
+    tg_username = callback.from_user.username or ""
+    
+    link_account_db(tg_id, tg_username, data['player_tag'], data['player_name'])
+    
+    await callback.message.edit_text(
+        f"✅ Аккаунт <b>{data['player_name']}</b> успешно привязан к вашему Telegram!\n"
+        f"Теперь ваш ник будет отображаться в отчетах.",
+        parse_mode="HTML"
+    )
+    await state.clear()
+
+@dp.callback_query(F.data == "confirm_link_no", LinkAccount.waiting_for_confirmation)
+async def confirm_no(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("❌ Привязка отменена.")
+    await state.clear()
+
+# ============================================================
+# 🔄 CALLBACK QUERY (Основное меню)
 # ============================================================
 @dp.callback_query(F.data == "back_menu")
 async def cb_back(callback: types.CallbackQuery):
@@ -454,6 +634,7 @@ async def on_startup(app: web.Application):
     if webhook_url:
         await bot.set_webhook(f"{webhook_url}/webhook")
         logger.info(f"🌐 Webhook: {webhook_url}/webhook")
+    init_db() # Инициализация БД при старте
     await init_coc_client()
 
 async def on_shutdown(app: web.Application):
