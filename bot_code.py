@@ -64,15 +64,15 @@ async def handle_clan_info(update: types.Message | types.CallbackQuery):
     try:
         clan = await coc_client.get_clan(CLAN_TAG)
         text = (
-            f"🏰 **{clan.name}** `{clan.tag}`\n"
-            f"📊 Уровень: `{clan.level}`\n"
-            f"👥 Участников: `{clan.member_count}/50`\n"
-            f"🏆 Трофеи: `{clan.points}`\n"
-            f"🛡️ Вход: `{clan.required_trophies}`\n"
-            f"🌍 Регион: `{clan.location.name if clan.location else 'Global'}`\n\n"
-            f"📝 _{clan.description or 'Нет описания'}_"
+            f"🏰 <b>{clan.name}</b> <code>{clan.tag}</code>\n"
+            f"📊 Уровень: <code>{clan.level}</code>\n"
+            f"👥 Участников: <code>{clan.member_count}/50</code>\n"
+            f"🏆 Трофеи: <code>{clan.points}</code>\n"
+            f"🛡️ Вход: <code>{clan.required_trophies}</code>\n"
+            f"🌍 Регион: <code>{clan.location.name if clan.location else 'Global'}</code>\n\n"
+            f"📝 <i>{clan.description or 'Нет описания'}</i>"
         )
-        await send_msg(update, text, parse_mode="Markdown", reply_markup=get_back_keyboard())
+        await send_msg(update, text, parse_mode="HTML", reply_markup=get_back_keyboard())
     except Exception as e:
         logger.error(f"Error clan info: {e}")
         await send_msg(update, "❌ Не удалось загрузить инфо о клане.")
@@ -92,12 +92,12 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery):
         our_clan = war.clan
         enemy_clan = war.opponent
         
-        # --- Заголовок войны ---
+        # --- Заголовок войны (HTML) ---
         header = (
-            f"⚔️ **ВОЙНА: {our_clan.name} vs {enemy_clan.name}**\n\n"
-            f"📊 Счёт: `{our_clan.stars}` : `{enemy_clan.stars}`\n"
-            f"💥 Разрушение: `{our_clan.destruction:.1f}%` : `{enemy_clan.destruction:.1f}%`\n"
-            f"⏳ Статус: `{war.state}`\n\n"
+            f"⚔️ <b>ВОЙНА: {our_clan.name} vs {enemy_clan.name}</b>\n\n"
+            f"📊 Счёт: <code>{our_clan.stars}</code> : <code>{enemy_clan.stars}</code>\n"
+            f"💥 Разрушение: <code>{our_clan.destruction:.1f}%</code> : <code>{enemy_clan.destruction:.1f}%</code>\n"
+            f"⏳ Статус: <code>{war.state}</code>\n"
         )
 
         # Сбор информации об участниках
@@ -108,7 +108,7 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery):
                 our_members_info.append({
                     'obj': m,
                     'name': m.name,
-                    'th': getattr(m, 'town_hall', 0),
+                    'th': getattr(m, 'town_hall', 0) or 0,
                     'map_pos': getattr(m, 'map_position', '?'),
                     'attacks_count': len(attacks),
                     'attacks': attacks
@@ -120,50 +120,69 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery):
                 enemy_members_info.append({
                     'obj': m,
                     'name': m.name,
-                    'th': getattr(m, 'town_hall', 0),
+                    'th': getattr(m, 'town_hall', 0) or 0,
                     'map_pos': getattr(m, 'map_position', '?'),
                     'destruction': getattr(m, 'destruction', 0) or 0,
                 })
 
+        # 1. Отправляем Заголовок
+        await send_msg(update, header, parse_mode="HTML")
+
         # --- Полный список состава и позиций ---
-        roster_text = "👥 **СОСТАВ И ПОЗИЦИИ:**\n"
         our_sorted_by_pos = sorted(our_members_info, key=lambda x: (x['map_pos'] if isinstance(x['map_pos'], int) else 99))
         
+        roster_chunks = []
+        current_chunk = "👥 <b>СОСТАВ И ПОЗИЦИИ:</b>\n"
         lazy_list = []
+        
         for m in our_sorted_by_pos:
             pos_str = f"Поз. {m['map_pos']}" if isinstance(m['map_pos'], int) else "Поз. ?"
             att_str = f"{m['attacks_count']}/{war.attacks_per_member}"
-            roster_text += f"• `{pos_str}` | {m['name']} (ТХ{m['th']}) - Атаки: {att_str}\n"
+            line = f"• <code>{pos_str}</code> | {m['name']} (ТХ{m['th']}) - Атаки: {att_str}\n"
             
+            # Проверка на лимит Telegram (4096), оставляем запас
+            if len(current_chunk) + len(line) > 3800:
+                roster_chunks.append(current_chunk)
+                current_chunk = "👥 <b>СОСТАВ (продолжение):</b>\n" + line
+            else:
+                current_chunk += line
+                
             if m['attacks_count'] < war.attacks_per_member:
                 lazy_list.append(f"• {m['name']} (ТХ{m['th']}) - осталось {war.attacks_per_member - m['attacks_count']}")
         
-        roster_text += "\n"
+        roster_chunks.append(current_chunk)
         
-        if lazy_list:
-            roster_text += f"⚠️ **Требуют внимания ({len(lazy_list)} чел.):**\n" + "\n".join(lazy_list) + "\n\n"
-        else:
-            roster_text += "✅ Все участники использовали все атаки!\n\n"
+        # Отправляем состав частями
+        for i, chunk in enumerate(roster_chunks):
+            # Если это последний кусок, добавляем список "Требуют внимания" в конце
+            if i == len(roster_chunks) - 1:
+                if lazy_list:
+                    chunk += f"\n⚠️ <b>Требуют внимания ({len(lazy_list)} чел.):</b>\n" + "\n".join(lazy_list)
+                else:
+                    chunk += "\n✅ Все участники использовали все атаки!"
+            await send_msg(update, chunk, parse_mode="HTML")
 
         # --- УМНЫЙ ПЛАН АТАКИ (AI) ---
         our_sorted_by_th = sorted(our_members_info, key=lambda x: x['th'], reverse=True)
         enemy_sorted = sorted(enemy_members_info, key=lambda x: (x['map_pos'] if isinstance(x['map_pos'], int) else 99))
         
-        # Выделяем топ-3 игроков на роль "Добивающих"
         dobiv_role_tags = set([m['obj'].tag for m in our_sorted_by_th[:3]])
         
-        plan_text = "🧠 **ТАКТИЧЕСКИЙ ПЛАН (AI)**\n\n"
+        plan_header = "🧠 <b>ТАКТИЧЕСКИЙ ПЛАН (AI)</b>\n\n"
         
-        # 1. Добивающие (Резерв)
-        plan_text += f"🛡️ **ДОБИВАЮЩИЕ (Резерв):**\n"
+        # Добивающие
         dobivators_names = []
         for tag in dobiv_role_tags:
             for m in our_members_info:
                 if m['obj'].tag == tag:
                     dobivators_names.append(f"{m['name']} (ТХ{m['th']})")
-        plan_text += ", ".join(dobivators_names) + "\n_Эти игроки ждут недобитые базы._\n\n"
         
-        # 2. Первый удар
+        plan_header += f"🛡️ <b>ДОБИВАЮЩИЕ (Резерв):</b>\n"
+        plan_header += ", ".join(dobivators_names) + "\n<i>Эти игроки ждут недобитые базы.</i>\n\n"
+        
+        await send_msg(update, plan_header, parse_mode="HTML")
+
+        # Основной удар
         first_strike_plan = []
         used_enemy_targets = set()
         
@@ -209,9 +228,10 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery):
             status = "Ждет 2-й ход" if a['attacks_count'] > 0 else "Первый ход"
             table_1.add_row([f"{a['name']} ({a_pos})", f"{t['name']} ({t_pos})", status])
             
-        plan_text += f"**1️⃣ ОСНОВНОЙ УДАР:**\n<pre><code>{table_1}</code></pre>\n\n"
+        msg_1 = f"<b>1️⃣ ОСНОВНОЙ УДАР:</b>\n<pre><code>{table_1}</code></pre>"
+        await send_msg(update, msg_1, parse_mode="HTML")
         
-        # 3. Второй удар (Добивание и Набивка)
+        # Второй удар
         second_strike_plan = []
         for attacker in our_sorted_by_pos:
             if attacker['attacks_count'] >= 2: continue
@@ -258,26 +278,17 @@ async def handle_war_plan(update: types.Message | types.CallbackQuery):
             table_2.add_row([f"{a['name']} (ТХ{a['th']})", f"{t['name']} (ТХ{t['th']})", pair['rec']])
             
         if second_strike_plan:
-            plan_text += f"**2️⃣ ДОБИВАНИЕ И НАБИВКА:**\n<pre><code>{table_2}</code></pre>"
+            msg_2 = f"<b>2️⃣ ДОБИВАНИЕ И НАБИВКА:</b>\n<pre><code>{table_2}</code></pre>"
         else:
-            plan_text += "_Нет доступных вторых атак или целей._"
-
-        full_text = header + roster_text + plan_text
-        
-        # Разбивка на части, если сообщение слишком длинное (лимит Telegram 4096)
-        if len(full_text) > 4000:
-            chunks = [full_text[i:i+4000] for i in range(0, len(full_text), 4000)]
-            for i, chunk in enumerate(chunks):
-                markup = get_back_keyboard() if i == len(chunks) - 1 else None
-                await send_msg(update, chunk, parse_mode="HTML", reply_markup=markup)
-        else:
-            await send_msg(update, full_text, parse_mode="HTML", reply_markup=get_back_keyboard())
+            msg_2 = "<i>Нет доступных вторых атак или целей.</i>"
+            
+        await send_msg(update, msg_2, parse_mode="HTML", reply_markup=get_back_keyboard())
 
     except coc.PrivateWarLog:
         await send_msg(update, "🔒 Лог войны закрыт настройками клана.")
     except Exception as e:
         logger.error(f"Error war plan: {e}", exc_info=True)
-        await send_msg(update, "❌ Ошибка формирования плана войны.")
+        await send_msg(update, f"❌ Ошибка формирования плана войны: {str(e)[:100]}")
 
 async def handle_remind_full(update: types.Message | types.CallbackQuery):
     if not coc_client: return
@@ -298,19 +309,19 @@ async def handle_remind_full(update: types.Message | types.CallbackQuery):
                 elif count == 1:
                     one_attack.append(f"• {m.name} (ТХ{getattr(m, 'town_hall', '?')})")
 
-        text = "⏰ **ПОЛНЫЙ СПИСОК НЕДОЧЕТОВ**\n\n"
+        text = "⏰ <b>ПОЛНЫЙ СПИСОК НЕДОЧЕТОВ</b>\n\n"
         
         if zero_attacks:
-            text += f"🔴 **ВООБЩЕ НЕ ХОДИЛИ ({len(zero_attacks)}):**\n" + "\n".join(zero_attacks) + "\n\n"
+            text += f"🔴 <b>ВООБЩЕ НЕ ХОДИЛИ ({len(zero_attacks)}):</b>\n" + "\n".join(zero_attacks) + "\n\n"
         else:
             text += "🟢 Все сделали хотя бы 1 атаку.\n\n"
 
         if one_attack:
-            text += f"🟠 **НУЖНО ДОБИТЬ ({len(one_attack)}):**\n" + "\n".join(one_attack)
+            text += f"🟠 <b>НУЖНО ДОБИТЬ ({len(one_attack)}):</b>\n" + "\n".join(one_attack)
         else:
             text += "🟢 Все использовали все атаки!"
 
-        await send_msg(update, text, parse_mode="Markdown", reply_markup=get_back_keyboard())
+        await send_msg(update, text, parse_mode="HTML", reply_markup=get_back_keyboard())
 
     except Exception as e:
         logger.error(f"Error remind: {e}")
@@ -349,7 +360,7 @@ async def handle_attack_logs(update: types.Message | types.CallbackQuery):
         if count == 0:
             await send_msg(update, "📭 Атак пока не зафиксировано.", reply_markup=get_back_keyboard())
         else:
-            text = f"📊 **ИСТОРИЯ АТАК (последние {count}):**\n<pre><code>{table}</code></pre>"
+            text = f"📊 <b>ИСТОРИЯ АТАК (последние {count}):</b>\n<pre><code>{table}</code></pre>"
             await send_msg(update, text, parse_mode="HTML", reply_markup=get_back_keyboard())
 
     except Exception as e:
@@ -360,11 +371,11 @@ async def handle_attack_logs(update: types.Message | types.CallbackQuery):
 async def send_msg(update: types.Message | types.CallbackQuery, text: str, parse_mode=None, reply_markup=None):
     try:
         if isinstance(update, types.Message):
-            await update.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
+            await update.answer(text, parse_mode=parse_mode, reply_markup=reply_markup, disable_web_page_preview=True)
         else:
-            await update.message.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
+            await update.message.answer(text, parse_mode=parse_mode, reply_markup=reply_markup, disable_web_page_preview=True)
     except Exception as e:
-        logger.error(f"Error sending message: {e}")
+        logger.error(f"Error sending message: {e} | Text length: {len(text)}")
 
 # ============================================================
 # 🤖 ОБРАБОТЧИКИ КОМАНД
@@ -405,7 +416,7 @@ async def cb_clan(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "war_plan")
 async def cb_war(callback: types.CallbackQuery):
-    await callback.answer()
+    await callback.answer("⏳ Формирую план войны...", show_alert=False)
     await handle_war_plan(callback)
 
 @dp.callback_query(F.data == "remind_full")
@@ -428,7 +439,7 @@ async def init_coc_client():
     while tries > 0:
         try:
             proxy = PROXY_URL if PROXY_URL else None
-            coc_client = coc.Client(proxy=proxy, throttle_limit=10) # Добавлен throttle_limit для стабильности
+            coc_client = coc.Client(proxy=proxy, throttle_limit=10)
             await coc_client.login(COC_EMAIL, COC_PASSWORD)
             logger.info("✅ Успешный вход в COC API!")
             return
