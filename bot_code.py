@@ -25,7 +25,7 @@ COC_PASSWORD = os.getenv('COC_PASSWORD')
 PROXY_URL = os.getenv('COC_PROXY', None)
 DATABASE_URL = os.getenv('DATABASE_URL')
 
-ADMIN_IDS = [1810701319]
+ADMIN_IDS = [int(os.getenv('ADMIN_ID', 0))]
 
 # ============================================================
 # 🛠 ЛОГИРОВАНИЕ
